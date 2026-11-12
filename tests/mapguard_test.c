@@ -28,6 +28,7 @@ int32_t unmap_remapped_memory(void *ptr) {
     return munmap(ptr, alloc_size);
 }
 
+#if defined(__linux__)
 void *remap_memory_test(char *desc, void *ptr) {
     void *mptr = mremap(ptr, alloc_size, alloc_size * 2, MREMAP_MAYMOVE);
     if(mptr != MAP_FAILED) {
@@ -38,6 +39,7 @@ void *remap_memory_test(char *desc, void *ptr) {
 
     return mptr;
 }
+#endif
 
 void map_rw_memory_test() {
     void *ptr = map_memory("RW", PROT_READ | PROT_WRITE);
@@ -97,6 +99,7 @@ void map_rw_then_x_memory_test() {
     unmap_memory(ptr);
 }
 
+#if defined(__linux__)
 void map_then_mremap_test() {
     void *ptr = map_memory("RW", PROT_READ | PROT_WRITE);
 
@@ -114,6 +117,7 @@ void map_then_mremap_test() {
 
     unmap_remapped_memory(ptr);
 }
+#endif
 
 void map_static_address_test() {
     uint8_t *ptr = mmap((void *) STATIC_ADDRESS, page_size * 16, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -425,7 +429,9 @@ int main(int argc, char *argv[]) {
         map_rw_memory_test();
         map_rwx_memory_test();
         map_rw_then_x_memory_test();
+#if defined(__linux__)
         map_then_mremap_test();
+#endif
         map_static_address_test();
         check_poison_bytes_test();
         check_x_to_w_test();

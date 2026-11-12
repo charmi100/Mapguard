@@ -18,9 +18,14 @@ TEST_SRC = tests
 DEMO_SRC = demo
 SRC_FILES = *.c
 BUILD_DIR = build
-STRIP = strip -s $(BUILD_DIR)/libmapguard.so
-
 UNAME := $(shell uname)
+
+ifeq ($(UNAME), Darwin)
+STRIP = strip -x $(BUILD_DIR)/libmapguard.so
+else
+STRIP = strip -s $(BUILD_DIR)/libmapguard.so
+endif
+
 ifeq ($(UNAME), Darwin)
 # $(error MacOS not supported, mapguard is Linux only)
 endif

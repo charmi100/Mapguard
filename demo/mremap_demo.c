@@ -8,6 +8,7 @@
 int main() {
     int ps = sysconf(_SC_PAGESIZE);
     printf("mremap demo\n");
+#if defined(__linux__)
     void *p = mmap(NULL, ps * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { perror("mmap"); return 1; }
     printf("  Mapped 2 pages at %p\n", p);
@@ -22,5 +23,9 @@ int main() {
     }
     munmap(np, ps * 8);
     printf("mremap demo complete - should show 0 outstanding leaks\n");
+#else
+    (void)ps;
+    printf("  mremap is Linux-only, skipping on this platform\n");
+#endif
     return 0;
 }

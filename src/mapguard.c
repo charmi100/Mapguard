@@ -1,11 +1,17 @@
 /* MapGuard - Copyright Chris Rohlf - 2025 */
 
 #include "mapguard.h"
+#include <strings.h>
+
 
 /* ===== Thread-local recursion guard =====
  * Prevents MapGuard's own internal mmap/munmap calls (e.g. for MCE pages,
  * guard pages) from being recorded in the leak tracker. */
 static __thread int mg_internal = 0;
+static __thread int mg_last_prot = 0;
+static __thread int mg_last_flags = 0;
+static __thread int mg_last_fd = -1;
+
 
 /* ===== Original MapGuard security mutex ===== */
 pthread_mutex_t _mg_mutex;
@@ -30,6 +36,10 @@ static mg_tracker_stats_t g_stats = {0};
 static unsigned int mg_snapshot_interval_ms = 5000;       /* default 5 seconds */
 static unsigned int mg_observe_count = 5;                  /* snapshots needed for growth check */
 static uint64_t mg_growth_threshold_bytes = 1048576;       /* 1 MiB default */
+static uint64_t mg_leak_threshold_ns = 0;
+static unsigned int mg_growth_percent = 0;
+static unsigned int mg_max_stack_frames = MG_MAX_STACK_FRAMES;
+
 
 /* ===== Snapshot background thread ===== */
 static pthread_t snapshot_tid;
@@ -57,6 +67,28 @@ void *(*g_real_mremap)(void *__addr, size_t __old_len, size_t __new_len, int __f
 /* ===================================================================
  * LEAK TRACKER IMPLEMENTATION (independent of security cache)
  * =================================================================== */
+
+/* Capture up to mg_max_stack_frames stack addresses */
+static void mg_capture_stack(uintptr_t *out_buf, size_t max_frames) {
+    void *buffer[64];
+    size_t limit = mg_max_stack_frames;
+    if(limit > max_frames) limit = max_frames;
+    if(limit > 64) limit = 64;
+    int depth = 0;
+    if(limit > 0) {
+        depth = backtrace(buffer, (int)limit);
+    }
+    size_t captured = (depth > 0) ? (size_t)depth : 0;
+    if(captured > limit) captured = limit;
+    for (size_t i = 0; i < captured; ++i) {
+        out_buf[i] = (uintptr_t)buffer[i];
+    }
+    for (size_t i = captured; i < max_frames; ++i) {
+        out_buf[i] = 0;
+    }
+}
+
+
 
 /* Allocate a leak entry from the static pool. Returns NULL if exhausted. */
 static mg_leak_entry_t *leak_pool_alloc(void) {
@@ -165,8 +197,15 @@ void mg_tracker_record_alloc(void *addr, size_t size, uintptr_t call_site) {
     if(e) {
         e->addr = addr;
         e->size = size;
-        e->alloc_ts = mg_now_ns();
+        uint64_t now = mg_now_ns();
+        e->alloc_ts = now;
+        e->last_update_ts = now;
         e->call_site = call_site;
+        e->prot = mg_last_prot;
+        e->flags = mg_last_flags;
+        e->fd = mg_last_fd;
+        e->status = MG_LEAK_STATUS_ACTIVE;
+        mg_capture_stack(e->stack, MG_MAX_STACK_FRAMES);
         leak_insert(e);
 
         g_stats.current_bytes += size;
@@ -183,6 +222,9 @@ void mg_tracker_record_free(void *addr, size_t size) {
     LOCK_LEAK();
     mg_leak_entry_t *e = leak_find(addr);
     if(e) {
+        uint64_t now = mg_now_ns();
+        e->lifetime_ns = now - e->alloc_ts;
+        e->last_update_ts = now;
         if(g_stats.current_bytes >= e->size) {
             g_stats.current_bytes -= e->size;
         } else {
@@ -191,6 +233,7 @@ void mg_tracker_record_free(void *addr, size_t size) {
         if(g_stats.outstanding > 0) {
             g_stats.outstanding--;
         }
+        e->status = MG_LEAK_STATUS_FREED;
         leak_remove(e);
     }
     UNLOCK_LEAK();
@@ -271,10 +314,18 @@ void mg_tracker_record_remap(void *old_addr, void *new_addr,
     mg_leak_entry_t *e = leak_find(old_addr);
     uint64_t preserved_ts = mg_now_ns();
     uintptr_t preserved_site = 0;
+    int preserved_prot = 0;
+    int preserved_flags = 0;
+    int preserved_fd = -1;
+    uintptr_t preserved_stack[8] = {0};
 
     if(e) {
         preserved_ts = e->alloc_ts;
         preserved_site = e->call_site;
+        preserved_prot = e->prot;
+        preserved_flags = e->flags;
+        preserved_fd = e->fd;
+        memcpy(preserved_stack, e->stack, sizeof(preserved_stack));
         /* Remove old stats */
         if(g_stats.current_bytes >= e->size) {
             g_stats.current_bytes -= e->size;
@@ -284,6 +335,7 @@ void mg_tracker_record_remap(void *old_addr, void *new_addr,
         if(g_stats.outstanding > 0) {
             g_stats.outstanding--;
         }
+        e->status = MG_LEAK_STATUS_REMAPPED;
         leak_remove(e);
     }
 
@@ -294,6 +346,11 @@ void mg_tracker_record_remap(void *old_addr, void *new_addr,
         ne->size = new_size;
         ne->alloc_ts = preserved_ts;
         ne->call_site = preserved_site;
+        ne->prot = preserved_prot;
+        ne->flags = preserved_flags;
+        ne->fd = preserved_fd;
+        ne->status = MG_LEAK_STATUS_ACTIVE;
+        memcpy(ne->stack, preserved_stack, sizeof(ne->stack));
         leak_insert(ne);
 
         g_stats.current_bytes += new_size;
@@ -340,10 +397,24 @@ bool mg_tracker_check_growth(void) {
         uint64_t oldest_bytes = g_stats.snap_bytes[oldest_idx];
         uint64_t newest_bytes = g_stats.snap_bytes[newest_idx];
 
-        if(newest_bytes > oldest_bytes &&
-           (newest_bytes - oldest_bytes) >= mg_growth_threshold_bytes) {
-            result = true;
-            g_stats.growth_warning_issued = true;
+        if(newest_bytes > oldest_bytes) {
+            bool growth_hit = false;
+            if(mg_growth_percent > 0) {
+                if(oldest_bytes > 0) {
+                    if(((newest_bytes - oldest_bytes) * 100 / oldest_bytes) >= mg_growth_percent) {
+                        growth_hit = true;
+                    }
+                } else {
+                    growth_hit = true;
+                }
+            } else if((newest_bytes - oldest_bytes) >= mg_growth_threshold_bytes) {
+                growth_hit = true;
+            }
+
+            if(growth_hit) {
+                result = true;
+                g_stats.growth_warning_issued = true;
+            }
         }
     }
 
@@ -351,16 +422,341 @@ bool mg_tracker_check_growth(void) {
     return result;
 }
 
-/* Generate final plain-text report */
+/* Helper: Convert protection flags to string */
+static const char *prot_to_str(int prot) {
+    switch (prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) {
+        case 0: return "---";
+        case PROT_READ: return "R--";
+        case PROT_WRITE: return "-W-";
+        case PROT_EXEC: return "--X";
+        case PROT_READ | PROT_WRITE: return "RW-";
+        case PROT_READ | PROT_EXEC: return "R-X";
+        case PROT_WRITE | PROT_EXEC: return "-WX";
+        case PROT_READ | PROT_WRITE | PROT_EXEC: return "RWX";
+        default: return "???";
+    }
+}
+
+/* Helper: Convert status enum to string */
+static const char *status_to_str(int status) {
+    switch(status) {
+        case MG_LEAK_STATUS_ACTIVE: return "ACTIVE";
+        case MG_LEAK_STATUS_REMAPPED: return "REMAPPED";
+        case MG_LEAK_STATUS_FREED: return "FREED";
+        default: return "UNKNOWN";
+    }
+}
+
+/* Helper: Convert mmap flags to string */
+static const char *flags_to_str(int flags, char *buf, size_t len) {
+    if(len == 0) return "";
+    buf[0] = '\0';
+    if(flags & MAP_SHARED) {
+        strncat(buf, "MAP_SHARED|", len - strlen(buf) - 1);
+    }
+    if(flags & MAP_PRIVATE) {
+        strncat(buf, "MAP_PRIVATE|", len - strlen(buf) - 1);
+    }
+#ifdef MAP_ANONYMOUS
+    if(flags & MAP_ANONYMOUS) {
+        strncat(buf, "MAP_ANONYMOUS|", len - strlen(buf) - 1);
+    }
+#elif defined(MAP_ANON)
+    if(flags & MAP_ANON) {
+        strncat(buf, "MAP_ANONYMOUS|", len - strlen(buf) - 1);
+    }
+#endif
+    if(flags & MAP_FIXED) {
+        strncat(buf, "MAP_FIXED|", len - strlen(buf) - 1);
+    }
+#ifdef MAP_FIXED_NOREPLACE
+    if(flags & MAP_FIXED_NOREPLACE) {
+        strncat(buf, "MAP_FIXED_NOREPLACE|", len - strlen(buf) - 1);
+    }
+#endif
+    size_t slen = strlen(buf);
+    if(slen > 0 && buf[slen - 1] == '|') {
+        buf[slen - 1] = '\0';
+    }
+    if(buf[0] == '\0') {
+        snprintf(buf, len, "0x%x", flags);
+    }
+    return buf;
+}
+
+#define MAX_REPORT_ENTRIES 256
+
+typedef struct {
+    void *addr;
+    size_t size;
+    uint64_t alloc_ts;
+    uintptr_t call_site;
+    int prot;
+    int flags;
+    int fd;
+    int status;
+    uintptr_t stack[8];
+} report_entry_t;
+
+/* Generate plain-text report */
+static void mg_generate_report_text(FILE *fp,
+                                    uint64_t total_allocs, uint64_t outstanding,
+                                    uint64_t current_bytes, uint64_t peak_bytes,
+                                    size_t valid_snaps, bool pool_exhausted,
+                                    bool growth_detected,
+                                    uint64_t growth_oldest, uint64_t growth_newest,
+                                    uint64_t growth_oldest_ts, uint64_t growth_newest_ts,
+                                    const report_entry_t *entries, size_t entry_count,
+                                    uint64_t now) {
+    fprintf(fp, "=======================================================\n");
+    fprintf(fp, "         MapGuard Memory Leak Detection Report\n");
+    fprintf(fp, "=======================================================\n\n");
+
+    fprintf(fp, "--- Summary ---\n");
+    fprintf(fp, "  Total allocations tracked:  %lu\n", (unsigned long)total_allocs);
+    fprintf(fp, "  Outstanding mappings:       %lu\n", (unsigned long)outstanding);
+    fprintf(fp, "  Current mapped bytes:       %lu\n", (unsigned long)current_bytes);
+    fprintf(fp, "  Peak mapped bytes:          %lu\n", (unsigned long)peak_bytes);
+    fprintf(fp, "  Snapshots collected:        %zu\n", valid_snaps);
+    if(pool_exhausted) {
+        fprintf(fp, "\n  *** WARNING: Tracking pool exhausted (max %d entries). ***\n"
+                    "  *** Some allocations may not have been tracked.       ***\n",
+                MG_LEAK_POOL_SIZE);
+    }
+    fprintf(fp, "\n");
+
+    /* Growth detection */
+    fprintf(fp, "--- Growth Detection ---\n");
+    if(valid_snaps < mg_observe_count) {
+        fprintf(fp, "  Insufficient snapshots for growth detection (%zu < %u required)\n",
+                valid_snaps, mg_observe_count);
+    } else if(growth_detected) {
+        double oldest_sec = (double)growth_oldest_ts / 1e9;
+        double newest_sec = (double)growth_newest_ts / 1e9;
+        fprintf(fp, "  *** GROWTH WARNING ***\n");
+        fprintf(fp, "  Memory grew from %lu bytes to %lu bytes\n",
+                (unsigned long)growth_oldest, (unsigned long)growth_newest);
+        if(mg_growth_percent > 0 && growth_oldest > 0) {
+            unsigned long pct = (unsigned long)((growth_newest - growth_oldest) * 100 / growth_oldest);
+            fprintf(fp, "  Growth: %lu bytes (+%lu%%, threshold: %u%%)\n",
+                    (unsigned long)(growth_newest - growth_oldest), pct, mg_growth_percent);
+        } else {
+            fprintf(fp, "  Growth: %lu bytes (threshold: %lu bytes)\n",
+                    (unsigned long)(growth_newest - growth_oldest),
+                    (unsigned long)mg_growth_threshold_bytes);
+        }
+        fprintf(fp, "  Observation window: %.3f s to %.3f s (monotonic)\n",
+                oldest_sec, newest_sec);
+    } else {
+        if(mg_growth_percent > 0) {
+            fprintf(fp, "  No sustained growth detected (threshold: %u%%)\n", mg_growth_percent);
+        } else {
+            fprintf(fp, "  No sustained growth detected (threshold: %lu bytes)\n",
+                    (unsigned long)mg_growth_threshold_bytes);
+        }
+    }
+    fprintf(fp, "\n");
+
+    /* Outstanding mappings */
+    fprintf(fp, "--- Outstanding Application Mappings (%zu) ---\n", entry_count);
+    if(entry_count == 0) {
+        fprintf(fp, "  (none - all mappings were properly freed)\n");
+    } else {
+        fprintf(fp, "  %-4s  %-18s  %-10s  %-10s  %-6s  %-26s  %-4s  %-10s  %-18s\n",
+                "#", "Address", "Size (B)", "Age (sec)", "Prot", "Flags", "FD", "Status", "Call Site");
+        fprintf(fp, "  %-4s  %-18s  %-10s  %-10s  %-6s  %-26s  %-4s  %-10s  %-18s\n",
+                "----", "------------------", "----------", "----------", "------", "--------------------------", "----", "----------", "------------------");
+        for(size_t i = 0; i < entry_count; i++) {
+            double age_sec = (double)(now - entries[i].alloc_ts) / 1e9;
+            char flags_buf[64];
+            flags_to_str(entries[i].flags, flags_buf, sizeof(flags_buf));
+            fprintf(fp, "  %-4zu  0x%-16lx  %-10zu  %-10.3f  %-6s  %-26s  %-4d  %-10s  0x%-16lx\n",
+                    i + 1,
+                    (unsigned long)(uintptr_t)entries[i].addr,
+                    entries[i].size,
+                    age_sec,
+                    prot_to_str(entries[i].prot),
+                    flags_buf,
+                    entries[i].fd,
+                    status_to_str(entries[i].status),
+                    (unsigned long)entries[i].call_site);
+
+            for(int frame_idx = 0; frame_idx < 8; frame_idx++) {
+                uintptr_t stack_addr = entries[i].stack[frame_idx];
+                if(stack_addr == 0) {
+                    continue;
+                }
+                Dl_info info;
+                if(dladdr((void *)stack_addr, &info) && info.dli_sname) {
+                    fprintf(fp, "      #%d  %s+0x%lx (%s)\n", frame_idx, info.dli_sname, 
+                            (unsigned long)((uintptr_t)stack_addr - (uintptr_t)info.dli_saddr), 
+                            info.dli_fname ? info.dli_fname : "?");
+                } else {
+                    fprintf(fp, "      #%d  0x%lx\n", frame_idx, (unsigned long)stack_addr);
+                }
+            }
+        }
+    }
+    if(entry_count >= MAX_REPORT_ENTRIES && outstanding > MAX_REPORT_ENTRIES) {
+        fprintf(fp, "\n  (report truncated to %d entries, %lu total outstanding)\n",
+                MAX_REPORT_ENTRIES, (unsigned long)outstanding);
+    }
+
+    fprintf(fp, "\n=======================================================\n");
+    fprintf(fp, "  Note: Only application mappings are shown above.\n");
+    fprintf(fp, "  Internal MapGuard allocations (guard pages, cache\n");
+    fprintf(fp, "  pages) are excluded from this report.\n");
+    fprintf(fp, "=======================================================\n");
+}
+
+/* Generate JSON report */
+static void mg_generate_report_json(FILE *fp,
+                                    uint64_t total_allocs, uint64_t outstanding,
+                                    uint64_t current_bytes, uint64_t peak_bytes,
+                                    size_t valid_snaps, bool pool_exhausted,
+                                    bool growth_detected,
+                                    uint64_t growth_oldest, uint64_t growth_newest,
+                                    uint64_t growth_oldest_ts, uint64_t growth_newest_ts,
+                                    const report_entry_t *entries, size_t entry_count,
+                                    uint64_t now) {
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"summary\": {\n");
+    fprintf(fp, "    \"total_allocations_tracked\": %lu,\n", (unsigned long)total_allocs);
+    fprintf(fp, "    \"outstanding_mappings\": %lu,\n", (unsigned long)outstanding);
+    fprintf(fp, "    \"current_mapped_bytes\": %lu,\n", (unsigned long)current_bytes);
+    fprintf(fp, "    \"peak_mapped_bytes\": %lu,\n", (unsigned long)peak_bytes);
+    fprintf(fp, "    \"snapshots_collected\": %zu,\n", valid_snaps);
+    fprintf(fp, "    \"pool_exhausted\": %s\n", pool_exhausted ? "true" : "false");
+    fprintf(fp, "  },\n");
+
+    fprintf(fp, "  \"growth_detection\": {\n");
+    fprintf(fp, "    \"growth_detected\": %s,\n", growth_detected ? "true" : "false");
+    fprintf(fp, "    \"snapshots_collected\": %zu,\n", valid_snaps);
+    fprintf(fp, "    \"snapshots_required\": %u,\n", mg_observe_count);
+    if(mg_growth_percent > 0) {
+        fprintf(fp, "    \"growth_threshold_percent\": %u,\n", mg_growth_percent);
+    } else {
+        fprintf(fp, "    \"growth_threshold_bytes\": %lu,\n", (unsigned long)mg_growth_threshold_bytes);
+    }
+    fprintf(fp, "    \"oldest_bytes\": %lu,\n", (unsigned long)growth_oldest);
+    fprintf(fp, "    \"newest_bytes\": %lu,\n", (unsigned long)growth_newest);
+    fprintf(fp, "    \"oldest_timestamp_sec\": %.3f,\n", (double)growth_oldest_ts / 1e9);
+    fprintf(fp, "    \"newest_timestamp_sec\": %.3f\n", (double)growth_newest_ts / 1e9);
+    fprintf(fp, "  },\n");
+
+    fprintf(fp, "  \"outstanding_mappings\": [\n");
+    for(size_t i = 0; i < entry_count; i++) {
+        double age_sec = (double)(now - entries[i].alloc_ts) / 1e9;
+        char flags_buf[64];
+        flags_to_str(entries[i].flags, flags_buf, sizeof(flags_buf));
+
+        fprintf(fp, "    {\n");
+        fprintf(fp, "      \"index\": %zu,\n", i + 1);
+        fprintf(fp, "      \"address\": \"0x%lx\",\n", (unsigned long)(uintptr_t)entries[i].addr);
+        fprintf(fp, "      \"size_bytes\": %zu,\n", entries[i].size);
+        fprintf(fp, "      \"age_seconds\": %.3f,\n", age_sec);
+        fprintf(fp, "      \"prot\": \"%s\",\n", prot_to_str(entries[i].prot));
+        fprintf(fp, "      \"flags\": \"%s\",\n", flags_buf);
+        fprintf(fp, "      \"fd\": %d,\n", entries[i].fd);
+        fprintf(fp, "      \"status\": \"%s\",\n", status_to_str(entries[i].status));
+        fprintf(fp, "      \"call_site\": \"0x%lx\",\n", (unsigned long)entries[i].call_site);
+        fprintf(fp, "      \"stack_trace\": [\n");
+
+        int frame_count = 0;
+        for(int f = 0; f < 8; f++) {
+            if(entries[i].stack[f] != 0) frame_count++;
+        }
+
+        int printed_frames = 0;
+        for(int f = 0; f < 8; f++) {
+            uintptr_t stack_addr = entries[i].stack[f];
+            if(stack_addr == 0) continue;
+            printed_frames++;
+
+            Dl_info info;
+            char frame_desc[512];
+            if(dladdr((void *)stack_addr, &info) && info.dli_sname) {
+                snprintf(frame_desc, sizeof(frame_desc), "#%d  %s+0x%lx (%s)",
+                         f, info.dli_sname,
+                         (unsigned long)((uintptr_t)stack_addr - (uintptr_t)info.dli_saddr),
+                         info.dli_fname ? info.dli_fname : "?");
+            } else {
+                snprintf(frame_desc, sizeof(frame_desc), "#%d  0x%lx", f, (unsigned long)stack_addr);
+            }
+
+            fprintf(fp, "        \"%s\"%s\n", frame_desc, (printed_frames < frame_count) ? "," : "");
+        }
+
+        fprintf(fp, "      ]\n");
+        fprintf(fp, "    }%s\n", (i + 1 < entry_count) ? "," : "");
+    }
+    fprintf(fp, "  ]\n");
+    fprintf(fp, "}\n");
+}
+
+/* Generate CSV report */
+static void mg_generate_report_csv(FILE *fp,
+                                   uint64_t total_allocs, uint64_t outstanding,
+                                   uint64_t current_bytes, uint64_t peak_bytes,
+                                   size_t valid_snaps, bool pool_exhausted,
+                                   bool growth_detected,
+                                   uint64_t growth_oldest, uint64_t growth_newest,
+                                   uint64_t growth_oldest_ts, uint64_t growth_newest_ts,
+                                   const report_entry_t *entries, size_t entry_count,
+                                   uint64_t now) {
+    (void)total_allocs;
+    (void)outstanding;
+    (void)current_bytes;
+    (void)peak_bytes;
+    (void)valid_snaps;
+    (void)pool_exhausted;
+    (void)growth_detected;
+    (void)growth_oldest;
+    (void)growth_newest;
+    (void)growth_oldest_ts;
+    (void)growth_newest_ts;
+
+    fprintf(fp, "index,address,size_bytes,age_seconds,prot,flags,fd,status,call_site\n");
+    for(size_t i = 0; i < entry_count; i++) {
+        double age_sec = (double)(now - entries[i].alloc_ts) / 1e9;
+        char flags_buf[64];
+        flags_to_str(entries[i].flags, flags_buf, sizeof(flags_buf));
+        fprintf(fp, "%zu,0x%lx,%zu,%.3f,%s,%s,%d,%s,0x%lx\n",
+                i + 1,
+                (unsigned long)(uintptr_t)entries[i].addr,
+                entries[i].size,
+                age_sec,
+                prot_to_str(entries[i].prot),
+                flags_buf,
+                entries[i].fd,
+                status_to_str(entries[i].status),
+                (unsigned long)entries[i].call_site);
+    }
+}
+
+/* Generate final report */
 void mg_tracker_generate_report(void) {
+    const char *format_env = getenv("MG_REPORT_FORMAT");
+    const char *ext = "txt";
+    int format = 0; /* 0: text, 1: json, 2: csv */
+    if(format_env) {
+        if(strcasecmp(format_env, "json") == 0) {
+            format = 1;
+            ext = "json";
+        } else if(strcasecmp(format_env, "csv") == 0) {
+            format = 2;
+            ext = "csv";
+        }
+    }
+
     char *report_path = getenv("MG_REPORT_PATH");
     char default_path[512];
     if(!report_path || report_path[0] == '\0') {
         char *home = getenv("HOME");
         if(home) {
-            snprintf(default_path, sizeof(default_path), "%s/mg_report.txt", home);
+            snprintf(default_path, sizeof(default_path), "%s/mg_report.%s", home, ext);
         } else {
-            snprintf(default_path, sizeof(default_path), "/tmp/mg_report.txt");
+            snprintf(default_path, sizeof(default_path), "/tmp/mg_report.%s", ext);
         }
         report_path = default_path;
     }
@@ -394,16 +790,6 @@ void mg_tracker_generate_report(void) {
         growth_newest_ts = g_stats.snap_ts[newest_idx];
     }
 
-    /* Build a local copy of outstanding entries for report */
-    typedef struct {
-        void *addr;
-        size_t size;
-        uint64_t alloc_ts;
-        uintptr_t call_site;
-    } report_entry_t;
-
-    /* Use a fixed-size buffer on stack (limited to 256 entries for report) */
-    #define MAX_REPORT_ENTRIES 256
     report_entry_t entries[MAX_REPORT_ENTRIES];
     size_t entry_count = 0;
 
@@ -415,6 +801,11 @@ void mg_tracker_generate_report(void) {
             entries[entry_count].size = cur->size;
             entries[entry_count].alloc_ts = cur->alloc_ts;
             entries[entry_count].call_site = cur->call_site;
+            entries[entry_count].prot = cur->prot;
+            entries[entry_count].flags = cur->flags;
+            entries[entry_count].fd = cur->fd;
+            entries[entry_count].status = (int)cur->status;
+            memcpy(entries[entry_count].stack, cur->stack, sizeof(entries[entry_count].stack));
             entry_count++;
         }
         cur = cur->next;
@@ -429,78 +820,27 @@ void mg_tracker_generate_report(void) {
         return;
     }
 
-    fprintf(fp, "=======================================================\n");
-    fprintf(fp, "         MapGuard Memory Leak Detection Report\n");
-    fprintf(fp, "=======================================================\n\n");
-
-    fprintf(fp, "--- Summary ---\n");
-    fprintf(fp, "  Total allocations tracked:  %lu\n", (unsigned long)total_allocs);
-    fprintf(fp, "  Outstanding mappings:       %lu\n", (unsigned long)outstanding);
-    fprintf(fp, "  Current mapped bytes:       %lu\n", (unsigned long)current_bytes);
-    fprintf(fp, "  Peak mapped bytes:          %lu\n", (unsigned long)peak_bytes);
-    fprintf(fp, "  Snapshots collected:        %zu\n", valid_snaps);
-    if(pool_exhausted) {
-        fprintf(fp, "\n  *** WARNING: Tracking pool exhausted (max %d entries). ***\n"
-                    "  *** Some allocations may not have been tracked.       ***\n",
-                MG_LEAK_POOL_SIZE);
-    }
-    fprintf(fp, "\n");
-
-    /* Growth detection */
-    fprintf(fp, "--- Growth Detection ---\n");
-    if(valid_snaps < mg_observe_count) {
-        fprintf(fp, "  Insufficient snapshots for growth detection (%zu < %u required)\n",
-                valid_snaps, mg_observe_count);
-    } else if(growth_detected) {
-        double oldest_sec = (double)growth_oldest_ts / 1e9;
-        double newest_sec = (double)growth_newest_ts / 1e9;
-        fprintf(fp, "  *** GROWTH WARNING ***\n");
-        fprintf(fp, "  Memory grew from %lu bytes to %lu bytes\n",
-                (unsigned long)growth_oldest, (unsigned long)growth_newest);
-        fprintf(fp, "  Growth: %lu bytes (threshold: %lu bytes)\n",
-                (unsigned long)(growth_newest - growth_oldest),
-                (unsigned long)mg_growth_threshold_bytes);
-        fprintf(fp, "  Observation window: %.3f s to %.3f s (monotonic)\n",
-                oldest_sec, newest_sec);
+    if(format == 1) {
+        mg_generate_report_json(fp, total_allocs, outstanding, current_bytes, peak_bytes,
+                                valid_snaps, pool_exhausted, growth_detected,
+                                growth_oldest, growth_newest, growth_oldest_ts, growth_newest_ts,
+                                entries, entry_count, now);
+    } else if(format == 2) {
+        mg_generate_report_csv(fp, total_allocs, outstanding, current_bytes, peak_bytes,
+                               valid_snaps, pool_exhausted, growth_detected,
+                               growth_oldest, growth_newest, growth_oldest_ts, growth_newest_ts,
+                               entries, entry_count, now);
     } else {
-        fprintf(fp, "  No sustained growth detected (threshold: %lu bytes)\n",
-                (unsigned long)mg_growth_threshold_bytes);
+        mg_generate_report_text(fp, total_allocs, outstanding, current_bytes, peak_bytes,
+                                valid_snaps, pool_exhausted, growth_detected,
+                                growth_oldest, growth_newest, growth_oldest_ts, growth_newest_ts,
+                                entries, entry_count, now);
     }
-    fprintf(fp, "\n");
-
-    /* Outstanding mappings */
-    fprintf(fp, "--- Outstanding Application Mappings (%zu) ---\n", entry_count);
-    if(entry_count == 0) {
-        fprintf(fp, "  (none - all mappings were properly freed)\n");
-    } else {
-        fprintf(fp, "  %-4s  %-18s  %-12s  %-12s  %-18s\n",
-                "#", "Address", "Size (B)", "Age (sec)", "Call Site");
-        fprintf(fp, "  %-4s  %-18s  %-12s  %-12s  %-18s\n",
-                "----", "------------------", "------------", "------------", "------------------");
-        for(size_t i = 0; i < entry_count; i++) {
-            double age_sec = (double)(now - entries[i].alloc_ts) / 1e9;
-            fprintf(fp, "  %-4zu  0x%-16lx  %-12zu  %-12.3f  0x%-16lx\n",
-                    i + 1,
-                    (unsigned long)(uintptr_t)entries[i].addr,
-                    entries[i].size,
-                    age_sec,
-                    (unsigned long)entries[i].call_site);
-        }
-    }
-    if(entry_count >= MAX_REPORT_ENTRIES && outstanding > MAX_REPORT_ENTRIES) {
-        fprintf(fp, "\n  (report truncated to %d entries, %lu total outstanding)\n",
-                MAX_REPORT_ENTRIES, (unsigned long)outstanding);
-    }
-
-    fprintf(fp, "\n=======================================================\n");
-    fprintf(fp, "  Note: Only application mappings are shown above.\n");
-    fprintf(fp, "  Internal MapGuard allocations (guard pages, cache\n");
-    fprintf(fp, "  pages) are excluded from this report.\n");
-    fprintf(fp, "=======================================================\n");
 
     fclose(fp);
     fprintf(stderr, "[MapGuard] Report written to: %s\n", report_path);
 }
+
 
 /* ===== Snapshot thread ===== */
 static void *snapshot_thread_func(void *arg) {
@@ -513,9 +853,15 @@ static void *snapshot_thread_func(void *arg) {
 
         /* Check growth and log warning */
         if(mg_tracker_check_growth()) {
-            fprintf(stderr, "[MapGuard] GROWTH WARNING: Memory usage increased by >= %lu bytes "
-                    "over %u observation(s)\n",
-                    (unsigned long)mg_growth_threshold_bytes, mg_observe_count);
+            if(mg_growth_percent > 0) {
+                fprintf(stderr, "[MapGuard] GROWTH WARNING: Memory usage increased by >= %u%% "
+                        "over %u observation(s)\n",
+                        mg_growth_percent, mg_observe_count);
+            } else {
+                fprintf(stderr, "[MapGuard] GROWTH WARNING: Memory usage increased by >= %lu bytes "
+                        "over %u observation(s)\n",
+                        (unsigned long)mg_growth_threshold_bytes, mg_observe_count);
+            }
         }
     }
     return NULL;
@@ -664,11 +1010,20 @@ mapguard_cache_entry_t *find_free_mce() {
     return (mapguard_cache_entry_t *)((uint8_t *)new_page + sizeof(mapguard_cache_metadata_t));
 }
 
+#if defined(__linux__)
 uint64_t rand_uint64(void) {
     uint64_t val = 0;
     syscall(SYS_getrandom, &val, sizeof(val), GRND_NONBLOCK);
     return val;
 }
+#else
+uint64_t rand_uint64(void) {
+    uint64_t high = (uint64_t)arc4random();
+    uint64_t low = (uint64_t)arc4random();
+    return (high << 32) | low;
+}
+#endif
+
 
 int32_t env_to_int(char *string) {
     char *p = getenv(string);
@@ -761,10 +1116,25 @@ __attribute__((constructor)) void mapguard_ctor() {
     char *env;
     env = getenv("MG_SNAPSHOT_INTERVAL_MS");
     if(env) mg_snapshot_interval_ms = (unsigned int)atoi(env);
+    env = getenv("MG_MONITOR_INTERVAL");
+    if(env) mg_snapshot_interval_ms = (unsigned int)atoi(env);
     env = getenv("MG_OBSERVE_COUNT");
+    if(env) mg_observe_count = (unsigned int)atoi(env);
+    env = getenv("MG_GROWTH_WINDOW");
     if(env) mg_observe_count = (unsigned int)atoi(env);
     env = getenv("MG_GROWTH_THRESHOLD_BYTES");
     if(env) mg_growth_threshold_bytes = (uint64_t)atoll(env);
+    env = getenv("MG_LEAK_THRESHOLD_SECONDS");
+    if(env) mg_leak_threshold_ns = (uint64_t)atoll(env) * 1000000000ULL;
+    env = getenv("MG_GROWTH_PERCENT");
+    if(env) mg_growth_percent = (unsigned int)atoi(env);
+    env = getenv("MG_MAX_STACK_FRAMES");
+    if(env) {
+        int val = atoi(env);
+        if(val >= 0) {
+            mg_max_stack_frames = (unsigned int)val;
+        }
+    }
 
     /* Enable configuration of mapguard via environment
      * variables during DSO load time only */
@@ -819,8 +1189,13 @@ __attribute__((destructor)) void mapguard_dtor() {
 
     /* Check growth one last time */
     if(mg_tracker_check_growth()) {
-        fprintf(stderr, "[MapGuard] GROWTH WARNING (final): Memory usage increased by >= %lu bytes\n",
-                (unsigned long)mg_growth_threshold_bytes);
+        if(mg_growth_percent > 0) {
+            fprintf(stderr, "[MapGuard] GROWTH WARNING (final): Memory usage increased by >= %u%%\n",
+                    mg_growth_percent);
+        } else {
+            fprintf(stderr, "[MapGuard] GROWTH WARNING (final): Memory usage increased by >= %lu bytes\n",
+                    (unsigned long)mg_growth_threshold_bytes);
+        }
     }
 
     /* Generate final report (does NOT hold lock during file I/O) */
@@ -869,6 +1244,9 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         void *ptr = g_real_mmap(addr, rounded_length, prot, flags, fd, offset);
         /* Track even in fast path, unless we're inside MapGuard */
         if(ptr != MAP_FAILED && !mg_internal) {
+            mg_last_prot = prot;
+            mg_last_flags = flags;
+            mg_last_fd = fd;
             mg_tracker_record_alloc(ptr, rounded_length, (uintptr_t)__builtin_return_address(0));
         }
         return ptr;
@@ -900,6 +1278,10 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     if(map_ptr == MAP_FAILED) {
         return MAP_FAILED;
     }
+
+    mg_last_prot = prot;
+    mg_last_flags = flags;
+    mg_last_fd = fd;
 
     if(g_mapguard_policy.enable_guard_pages) {
         mg_internal = 1;
@@ -948,6 +1330,9 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 
     /* Record in leak tracker (only for application allocations) */
     if(!mg_internal) {
+        mg_last_prot = prot;
+        mg_last_flags = flags;
+        mg_last_fd = fd;
         mg_tracker_record_alloc(return_ptr, rounded_length,
                                 (uintptr_t)__builtin_return_address(0));
     }

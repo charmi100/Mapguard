@@ -4,8 +4,14 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>
+#if defined(__linux__)
 #include <link.h>
+#endif
+#if defined(__linux__)
 #include <linux/random.h>
+#else
+#define GRND_NONBLOCK 0
+#endif
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,6 +21,21 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <time.h>
+
+/* Platform compatibility: provide fallback defines for Linux-specific
+ * constants that don't exist on macOS/BSD. These allow the code to compile
+ * on non-Linux platforms for development/testing purposes. */
+#if !defined(__linux__)
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+#ifndef MREMAP_MAYMOVE
+#define MREMAP_MAYMOVE 1
+#endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+#endif
 
 #if THREAD_SUPPORT
 #include <pthread.h>
@@ -28,6 +49,11 @@
 #define GUARD_PAGE_COUNT 2
 
 /* Keep ALL existing LOG macros exactly as they are */
+#include <execinfo.h>
+
+#ifndef MG_MAX_STACK_FRAMES
+#define MG_MAX_STACK_FRAMES 8
+#endif
 #if DEBUG
 #define LOG_ERROR(msg, ...) \
     fprintf(stderr, "[LOG][%d](%s) (%s) - " msg "\n", getpid(), __FUNCTION__, strerror(errno), ##__VA_ARGS__); \
@@ -139,11 +165,18 @@ typedef struct mg_leak_entry {
     void *addr;                    /* start address of mapping */
     size_t size;                   /* size in bytes */
     uint64_t alloc_ts;             /* allocation timestamp (ns monotonic) */
+    uint64_t last_update_ts;       /* last update timestamp (ns monotonic) */
+    uint64_t lifetime_ns;          /* total lifetime from allocation to free (ns) */
     uintptr_t call_site;           /* return address of caller */
+    int prot;                      /* protection flags (PROT_*) */
+    int flags;                     /* mmap flags */
+    int fd;                        /* file descriptor (or -1) */
+    enum { MG_LEAK_STATUS_ACTIVE = 0, MG_LEAK_STATUS_REMAPPED = 1, MG_LEAK_STATUS_FREED = 2 } status; /* mapping status */
     bool in_use;                   /* whether this pool slot is active */
     struct mg_leak_entry *next;    /* linked list for iteration */
     struct mg_leak_entry *prev;    /* doubly linked list */
     struct mg_leak_entry *hash_next; /* hash bucket chain */
+    uintptr_t stack[8];            /* captured stack trace addresses (max 8) */
 } mg_leak_entry_t;
 
 /* Snapshot ring buffer for growth detection */
