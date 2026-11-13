@@ -3,7 +3,12 @@
 ## This runs all unit tests and reports the results to stdout
 ## Copyright Chris Rohlf - 2025
 
-make tests
+if ! make CC="${CC:-clang}" tests; then
+    echo "Build failed"
+    exit 1
+fi
+
+TEST_OUTPUT=${MG_TEST_OUTPUT:-test_output.txt}
 
 export MG_PANIC_ON_VIOLATION=0
 export MG_USE_MAPPING_CACHE=1
@@ -15,7 +20,7 @@ export MG_PREVENT_X_TRANSITION=1
 export MG_POISON_ON_ALLOCATION=1
 export MG_ENABLE_SYSLOG=0
 
-tests=("mapguard_test" "mapguard_thread_test")
+tests=("mapguard_test" "mapguard_mremap_test" "mapguard_partial_munmap_test" "mapguard_concurrency_test" "mapguard_thread_test" "mapguard_guard_page_test" "mapguard_overflow_test")
 failure=0
 succeeded=0
 
@@ -28,20 +33,85 @@ fi
 
 for t in "${tests[@]}"; do
     echo -n "Running $t test"
-    echo "Running $t test" >> test_output.txt 2>&1
-    LD_PRELOAD=build/libmapguard.so build/$t >> test_output.txt 2>&1
+    echo "Running $t test" >> "$TEST_OUTPUT" 2>&1
+    if [ "$t" = "mapguard_guard_page_test" ] || [ "$t" = "mapguard_overflow_test" ]; then
+        MG_ENABLE_GUARD_PAGES=1 MG_USE_MAPPING_CACHE=1 MG_PREVENT_STATIC_ADDRESS=0 \
+            LD_PRELOAD=build/libmapguard.so build/$t >> "$TEST_OUTPUT" 2>&1
+    elif [ "$t" = "mapguard_mremap_test" ] || [ "$t" = "mapguard_partial_munmap_test" ] || [ "$t" = "mapguard_concurrency_test" ]; then
+        MG_ENABLE_GUARD_PAGES=0 MG_PREVENT_STATIC_ADDRESS=0 LD_PRELOAD=build/libmapguard.so build/$t >> "$TEST_OUTPUT" 2>&1
+    else
+        LD_PRELOAD=build/libmapguard.so build/$t >> "$TEST_OUTPUT" 2>&1
+    fi
     ret=$?
 
     if [ $ret -ne 0 ]; then
         echo "... Failed"
-        echo "... Failed" >> test_output.txt 2>&1
+        echo "... Failed" >> "$TEST_OUTPUT" 2>&1
         failure=$((failure+1))
     else
         echo "... Succeeded"
-        echo "... Succeeded" >> test_output.txt 2>&1
+        echo "... Succeeded" >> "$TEST_OUTPUT" 2>&1
         succeeded=$((succeeded+1))
     fi
 done
+
+for cache in 0 1; do
+    echo -n "Running metadata pool exhaustion (mapping cache=$cache)"
+    echo "Running metadata pool exhaustion (mapping cache=$cache)" >> "$TEST_OUTPUT" 2>&1
+    MG_ENABLE_GUARD_PAGES=0 MG_USE_MAPPING_CACHE=$cache MG_PREVENT_STATIC_ADDRESS=0 \
+        LD_PRELOAD=build/libmapguard.so build/mapguard_pool_exhaustion_test \
+        >> "$TEST_OUTPUT" 2>&1
+    ret=$?
+    if [ $ret -ne 0 ]; then
+        echo "... Failed"
+        echo "... Failed" >> "$TEST_OUTPUT" 2>&1
+        failure=$((failure+1))
+    else
+        echo "... Succeeded"
+        echo "... Succeeded" >> "$TEST_OUTPUT" 2>&1
+        succeeded=$((succeeded+1))
+    fi
+done
+
+for scenario in sustained stable transient; do
+    echo -n "Running growth detection test ($scenario)"
+    echo "Running growth detection test ($scenario)" >> "$TEST_OUTPUT" 2>&1
+    MG_SNAPSHOT_INTERVAL_MS=100 MG_OBSERVE_COUNT=5 MG_GROWTH_THRESHOLD_BYTES=1048576 \
+        MG_USE_MAPPING_CACHE=1 MG_ENABLE_GUARD_PAGES=0 MG_PREVENT_STATIC_ADDRESS=0 \
+        LD_PRELOAD=build/libmapguard.so build/mapguard_growth_test "$scenario" \
+        >> "$TEST_OUTPUT" 2>&1
+    ret=$?
+    if [ $ret -ne 0 ]; then
+        echo "... Failed"
+        echo "... Failed" >> "$TEST_OUTPUT" 2>&1
+        failure=$((failure+1))
+    else
+        echo "... Succeeded"
+        echo "... Succeeded" >> "$TEST_OUTPUT" 2>&1
+        succeeded=$((succeeded+1))
+    fi
+done
+
+report_dir=$(mktemp -d "${TMPDIR:-/tmp}/mapguard-reports.XXXXXX")
+report_binary="$report_dir/report \"quoted\".test"
+cp build/mapguard_reporting_test "$report_binary"
+for format in text json csv; do
+    report_path="$report_dir/report.$format"
+    output_path="$report_dir/output.$format"
+    echo -n "Running $format report validation"
+    if MG_ENABLE_GUARD_PAGES=0 MG_USE_MAPPING_CACHE=0 MG_PREVENT_STATIC_ADDRESS=0 \
+        MG_REPORT_FORMAT="$format" LD_PRELOAD=build/libmapguard.so \
+        "$report_binary" "$format" "$report_path" >"$output_path" 2>>"$TEST_OUTPUT" &&
+        python3 tests/validate_mapguard_report.py "$format" "$report_path" "$output_path" \
+        >>"$TEST_OUTPUT" 2>&1; then
+        echo "... Succeeded"
+        succeeded=$((succeeded+1))
+    else
+        echo "... Failed"
+        failure=$((failure+1))
+    fi
+done
+rm -rf "$report_dir"
 
 unset MG_PANIC_ON_VIOLATION
 unset MG_USE_MAPPING_CACHE
@@ -52,3 +122,8 @@ unset MG_ENABLE_GUARD_PAGES
 unset MG_PREVENT_X_TRANSITION
 unset MG_POISON_ON_ALLOCATION
 unset MG_ENABLE_SYSLOG
+
+echo "Tests: $succeeded succeeded, $failure failed"
+if [ "$failure" -ne 0 ]; then
+    exit 1
+fi

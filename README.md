@@ -52,12 +52,20 @@ LD_PRELOAD=build/libmapguard.so ./your_program
 
 ## Testing
 
-You can test MapGuard by running `./run_tests.sh`:
+Run the Linux regression and audit tests with `./run_tests.sh`. The suite covers
+basic tracking, `mremap()`, full and partial `munmap()`, concurrent mapping
+operations, persistent-growth scenarios, guard pages, metadata-pool exhaustion,
+overflow handling, and text/JSON/CSV report validation. Report validation
+requires Python 3.
+
+The test compiler defaults to Clang; select another compiler with `CC`, and
+optionally direct test logs with `MG_TEST_OUTPUT`:
 
 ```
-# ./run_tests.sh 
+# CC=gcc MG_TEST_OUTPUT=/tmp/mapguard-tests.log ./run_tests.sh
 Running mapguard_test test... Succeeded
-Running mapguard_thread_test test... Succeeded
+...
+Tests: 15 succeeded, 0 failed
 
 # ./run_perf_test.sh
 ================================================================

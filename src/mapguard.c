@@ -2,6 +2,7 @@
 
 #include "mapguard.h"
 #include <strings.h>
+#include <stdatomic.h>
 
 
 /* ===== Thread-local recursion guard =====
@@ -40,10 +41,14 @@ static uint64_t mg_leak_threshold_ns = 0;
 static unsigned int mg_growth_percent = 0;
 static unsigned int mg_max_stack_frames = MG_MAX_STACK_FRAMES;
 
+static void mg_log_pool_exhaustion(void) {
+    fprintf(stderr, "[MapGuard] WARNING: leak-tracking pool exhausted (%d entries). "
+            "Further allocations will not be tracked.\n", MG_LEAK_POOL_SIZE);
+}
 
 /* ===== Snapshot background thread ===== */
 static pthread_t snapshot_tid;
-static volatile int snapshot_thread_running = 0;
+static atomic_bool snapshot_thread_running = ATOMIC_VAR_INIT(false);
 
 /* ===== Original MapGuard globals ===== */
 mapguard_cache_metadata_t *mce_head;
@@ -57,6 +62,16 @@ static size_t g_page_size;
 static uint32_t g_page_shift;
 
 mapguard_policy_t g_mapguard_policy;
+
+static bool mg_round_up_page(size_t length, size_t *rounded_length) {
+    if(g_page_size == 0 || !rounded_length ||
+       length > SIZE_MAX - (g_page_size - 1)) {
+        errno = EINVAL;
+        return false;
+    }
+    *rounded_length = (length + g_page_size - 1) & ~(g_page_size - 1);
+    return true;
+}
 
 /* Pointers to hooked libc functions */
 void *(*g_real_mmap)(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
@@ -93,12 +108,16 @@ static void mg_capture_stack(uintptr_t *out_buf, size_t max_frames) {
 /* Allocate a leak entry from the static pool. Returns NULL if exhausted. */
 static mg_leak_entry_t *leak_pool_alloc(void) {
     /* Caller must hold _mg_leak_mutex */
-    if(leak_pool_used >= MG_LEAK_POOL_SIZE) {
-        if(!g_stats.pool_exhausted) {
-            g_stats.pool_exhausted = true;
-            fprintf(stderr, "[MapGuard] WARNING: leak-tracking pool exhausted (%d entries). "
-                    "Further allocations will not be tracked.\n", MG_LEAK_POOL_SIZE);
+    for(size_t i = 0; i < leak_pool_used; ++i) {
+        if(!leak_pool[i].in_use) {
+            mg_leak_entry_t *e = &leak_pool[i];
+            memset(e, 0, sizeof(*e));
+            e->in_use = true;
+            return e;
         }
+    }
+    if(leak_pool_used >= MG_LEAK_POOL_SIZE) {
+        g_stats.pool_exhausted = true;
         return NULL;
     }
     mg_leak_entry_t *e = &leak_pool[leak_pool_used++];
@@ -111,6 +130,7 @@ static mg_leak_entry_t *leak_pool_alloc(void) {
 static void leak_insert(mg_leak_entry_t *e) {
     /* Caller must hold _mg_leak_mutex */
     uint32_t bucket = MG_LEAK_HASH(e->addr);
+    e->in_use = true;
     e->hash_next = leak_hash_table[bucket];
     leak_hash_table[bucket] = e;
 
@@ -139,9 +159,7 @@ static mg_leak_entry_t *leak_find(void *addr) {
     return NULL;
 }
 
-/* Remove a leak entry from hash table and linked list.
- * Note: we mark it as not in_use but don't reclaim the pool slot
- * (static pool, slots are not reused to keep it simple and safe). */
+/* Remove a leak entry from hash table and linked list. */
 static void leak_remove(mg_leak_entry_t *e) {
     /* Caller must hold _mg_leak_mutex */
     /* Remove from hash table */
@@ -188,11 +206,13 @@ void mg_tracker_init(void) {
     leak_list_tail = NULL;
     leak_pool_used = 0;
     memset(&g_stats, 0, sizeof(g_stats));
-    pthread_mutex_init(&_mg_leak_mutex, NULL);
 }
 
 void mg_tracker_record_alloc(void *addr, size_t size, uintptr_t call_site) {
+    int was_internal = mg_internal;
+    mg_internal = 1;
     LOCK_LEAK();
+    bool pool_exhausted_before = g_stats.pool_exhausted;
     mg_leak_entry_t *e = leak_pool_alloc();
     if(e) {
         e->addr = addr;
@@ -215,42 +235,131 @@ void mg_tracker_record_alloc(void *addr, size_t size, uintptr_t call_site) {
             g_stats.peak_bytes = g_stats.current_bytes;
         }
     }
+    bool log_pool_exhaustion =
+        !pool_exhausted_before && g_stats.pool_exhausted;
     UNLOCK_LEAK();
+    if(log_pool_exhaustion) {
+        mg_log_pool_exhaustion();
+    }
+    mg_internal = was_internal;
 }
 
 void mg_tracker_record_free(void *addr, size_t size) {
+    uintptr_t unmap_start = (uintptr_t)addr;
+    if(size == 0 || size > UINTPTR_MAX - unmap_start) {
+        return;
+    }
+    uintptr_t unmap_end = unmap_start + size;
+
+    int was_internal = mg_internal;
+    mg_internal = 1;
     LOCK_LEAK();
-    mg_leak_entry_t *e = leak_find(addr);
-    if(e) {
-        uint64_t now = mg_now_ns();
-        e->lifetime_ns = now - e->alloc_ts;
+    bool pool_exhausted_before = g_stats.pool_exhausted;
+    bool split_untracked = false;
+    uint64_t now = mg_now_ns();
+    mg_leak_entry_t *e = leak_list_head;
+    while(e) {
+        mg_leak_entry_t *next = e->next;
+        uintptr_t entry_start = (uintptr_t)e->addr;
+        if(e->size > UINTPTR_MAX - entry_start) {
+            e = next;
+            continue;
+        }
+        uintptr_t entry_end = entry_start + e->size;
+        uintptr_t overlap_start = unmap_start > entry_start ? unmap_start : entry_start;
+        uintptr_t overlap_end = unmap_end < entry_end ? unmap_end : entry_end;
+        if(overlap_start >= overlap_end) {
+            e = next;
+            continue;
+        }
+
+        size_t released = overlap_end - overlap_start;
         e->last_update_ts = now;
-        if(g_stats.current_bytes >= e->size) {
-            g_stats.current_bytes -= e->size;
+        if(overlap_start == entry_start && overlap_end == entry_end) {
+            e->lifetime_ns = now - e->alloc_ts;
+            e->status = MG_LEAK_STATUS_FREED;
+            leak_remove(e);
+            if(g_stats.outstanding > 0) {
+                g_stats.outstanding--;
+            }
+        } else if(overlap_start == entry_start) {
+            leak_remove(e);
+            e->addr = (void *)overlap_end;
+            e->size = entry_end - overlap_end;
+            e->status = MG_LEAK_STATUS_ACTIVE;
+            leak_insert(e);
+        } else if(overlap_end == entry_end) {
+            e->size = overlap_start - entry_start;
+            e->status = MG_LEAK_STATUS_ACTIVE;
+        } else {
+            mg_leak_entry_t *upper = leak_pool_alloc();
+            if(!upper) {
+                split_untracked = true;
+                leak_remove(e);
+                if(g_stats.outstanding > 0) {
+                    g_stats.outstanding--;
+                }
+                if(g_stats.current_bytes >= e->size) {
+                    g_stats.current_bytes -= e->size;
+                } else {
+                    g_stats.current_bytes = 0;
+                }
+                e = next;
+                continue;
+            }
+            upper->addr = (void *)overlap_end;
+            upper->size = entry_end - overlap_end;
+            upper->alloc_ts = e->alloc_ts;
+            upper->last_update_ts = now;
+            upper->call_site = e->call_site;
+            upper->prot = e->prot;
+            upper->flags = e->flags;
+            upper->fd = e->fd;
+            upper->status = MG_LEAK_STATUS_ACTIVE;
+            memcpy(upper->stack, e->stack, sizeof(upper->stack));
+            e->size = overlap_start - entry_start;
+            e->status = MG_LEAK_STATUS_ACTIVE;
+            leak_insert(upper);
+            g_stats.outstanding++;
+        }
+
+        if(g_stats.current_bytes >= released) {
+            g_stats.current_bytes -= released;
         } else {
             g_stats.current_bytes = 0;
         }
-        if(g_stats.outstanding > 0) {
-            g_stats.outstanding--;
-        }
-        e->status = MG_LEAK_STATUS_FREED;
-        leak_remove(e);
+        e = next;
     }
+    bool log_pool_exhaustion =
+        !pool_exhausted_before && g_stats.pool_exhausted;
     UNLOCK_LEAK();
+    if(log_pool_exhaustion) {
+        mg_log_pool_exhaustion();
+    }
+    if(split_untracked) {
+        fprintf(stderr, "[MapGuard] WARNING: cannot represent partial unmap split; "
+                "remaining regions are no longer tracked\n");
+    }
+    mg_internal = was_internal;
 }
 
 /* Handle partial munmap from beginning or end: update entry in place */
 void mg_tracker_record_partial_free(void *addr, size_t free_size,
                                      void *remaining_addr, size_t remaining_size) {
+    int was_internal = mg_internal;
+    mg_internal = 1;
     LOCK_LEAK();
     mg_leak_entry_t *e = leak_find(addr);
     if(e) {
+        uint64_t now = mg_now_ns();
         /* Remove old entry from hash (address is changing) */
         leak_remove(e);
         /* Update with remaining portion */
         e->in_use = true;
         e->addr = remaining_addr;
         e->size = remaining_size;
+        e->status = MG_LEAK_STATUS_ACTIVE;
+        e->last_update_ts = now;
         /* Preserve original alloc_ts and call_site */
         leak_insert(e);
 
@@ -264,6 +373,7 @@ void mg_tracker_record_partial_free(void *addr, size_t free_size,
         }
     }
     UNLOCK_LEAK();
+    mg_internal = was_internal;
 }
 
 /* Handle split (middle unmap): original becomes lower, new entry for upper */
@@ -271,31 +381,68 @@ void mg_tracker_record_split(void *orig_addr,
                               void *lower_addr, size_t lower_size,
                               void *upper_addr, size_t upper_size,
                               uint64_t orig_ts, uintptr_t orig_site) {
+    int was_internal = mg_internal;
+    mg_internal = 1;
     LOCK_LEAK();
+    bool pool_exhausted_before = g_stats.pool_exhausted;
+    bool split_untracked = false;
     mg_leak_entry_t *e = leak_find(orig_addr);
     size_t freed_bytes = 0;
+    uint64_t now = mg_now_ns();
     if(e) {
+        if(lower_size > e->size || upper_size > e->size - lower_size) {
+            UNLOCK_LEAK();
+            mg_internal = was_internal;
+            return;
+        }
+        mg_leak_entry_t *upper = leak_pool_alloc();
+        if(!upper) {
+            split_untracked = true;
+            size_t untracked_size = e->size;
+            leak_remove(e);
+            if(g_stats.outstanding > 0) {
+                g_stats.outstanding--;
+            }
+            if(g_stats.current_bytes >= untracked_size) {
+                g_stats.current_bytes -= untracked_size;
+            } else {
+                g_stats.current_bytes = 0;
+            }
+            bool log_pool_exhaustion =
+                !pool_exhausted_before && g_stats.pool_exhausted;
+            UNLOCK_LEAK();
+            if(log_pool_exhaustion) {
+                mg_log_pool_exhaustion();
+            }
+            if(split_untracked) {
+                fprintf(stderr, "[MapGuard] WARNING: cannot track upper region after split; "
+                        "remaining regions are no longer tracked\n");
+            }
+            mg_internal = was_internal;
+            return;
+        }
         freed_bytes = e->size - lower_size - upper_size;
+        upper->addr = upper_addr;
+        upper->size = upper_size;
+        upper->alloc_ts = orig_ts;
+        upper->call_site = orig_site;
+        upper->last_update_ts = now;
+        upper->status = MG_LEAK_STATUS_ACTIVE;
+        upper->prot = e->prot;
+        upper->flags = e->flags;
+        upper->fd = e->fd;
+        memcpy(upper->stack, e->stack, sizeof(upper->stack));
+
         /* Update original entry to be the lower portion */
         leak_remove(e);
         e->in_use = true;
         e->addr = lower_addr;
         e->size = lower_size;
+        e->last_update_ts = now;
+        e->status = MG_LEAK_STATUS_ACTIVE;
         leak_insert(e);
-    }
-
-    /* Allocate new entry for upper portion */
-    mg_leak_entry_t *upper = leak_pool_alloc();
-    if(upper) {
-        upper->addr = upper_addr;
-        upper->size = upper_size;
-        upper->alloc_ts = orig_ts;
-        upper->call_site = orig_site;
         leak_insert(upper);
-
         g_stats.outstanding++;  /* One more entry (split creates two from one) */
-    } else {
-        fprintf(stderr, "[MapGuard] WARNING: leak-tracking pool exhausted during split\n");
     }
 
     /* Adjust byte count for freed middle portion */
@@ -304,64 +451,76 @@ void mg_tracker_record_split(void *orig_addr,
     } else {
         g_stats.current_bytes = 0;
     }
+    bool log_pool_exhaustion =
+        !pool_exhausted_before && g_stats.pool_exhausted;
     UNLOCK_LEAK();
+    if(log_pool_exhaustion) {
+        mg_log_pool_exhaustion();
+    }
+    mg_internal = was_internal;
 }
 
 /* Handle mremap: remove old entry, create new with preserved metadata */
 void mg_tracker_record_remap(void *old_addr, void *new_addr,
                               size_t old_size, size_t new_size) {
-    LOCK_LEAK();
-    mg_leak_entry_t *e = leak_find(old_addr);
-    uint64_t preserved_ts = mg_now_ns();
-    uintptr_t preserved_site = 0;
-    int preserved_prot = 0;
-    int preserved_flags = 0;
-    int preserved_fd = -1;
-    uintptr_t preserved_stack[8] = {0};
-
-    if(e) {
-        preserved_ts = e->alloc_ts;
-        preserved_site = e->call_site;
-        preserved_prot = e->prot;
-        preserved_flags = e->flags;
-        preserved_fd = e->fd;
-        memcpy(preserved_stack, e->stack, sizeof(preserved_stack));
-        /* Remove old stats */
-        if(g_stats.current_bytes >= e->size) {
-            g_stats.current_bytes -= e->size;
-        } else {
-            g_stats.current_bytes = 0;
-        }
-        if(g_stats.outstanding > 0) {
-            g_stats.outstanding--;
-        }
-        e->status = MG_LEAK_STATUS_REMAPPED;
-        leak_remove(e);
+    int was_internal = mg_internal;
+    mg_internal = 1;
+    if(new_addr != old_addr) {
+        mg_tracker_record_free(new_addr, new_size);
     }
-
-    /* Create new entry with preserved timestamp and call site */
-    mg_leak_entry_t *ne = leak_pool_alloc();
-    if(ne) {
-        ne->addr = new_addr;
-        ne->size = new_size;
-        ne->alloc_ts = preserved_ts;
-        ne->call_site = preserved_site;
-        ne->prot = preserved_prot;
-        ne->flags = preserved_flags;
-        ne->fd = preserved_fd;
-        ne->status = MG_LEAK_STATUS_ACTIVE;
-        memcpy(ne->stack, preserved_stack, sizeof(ne->stack));
-        leak_insert(ne);
-
-        g_stats.current_bytes += new_size;
-        g_stats.outstanding++;
+    LOCK_LEAK();
+    bool pool_exhausted_before = g_stats.pool_exhausted;
+    mg_leak_entry_t *e = leak_find(old_addr);
+    uint64_t now = mg_now_ns();
+    (void)old_size;
+    if(e) {
+        if(new_addr != old_addr) {
+            leak_remove(e);
+            e->addr = new_addr;
+        }
+        if(new_size >= e->size) {
+            g_stats.current_bytes += new_size - e->size;
+        } else {
+            size_t released = e->size - new_size;
+            if(g_stats.current_bytes >= released) {
+                g_stats.current_bytes -= released;
+            } else {
+                g_stats.current_bytes = 0;
+            }
+        }
+        e->size = new_size;
+        e->last_update_ts = now;
+        e->status = MG_LEAK_STATUS_ACTIVE;
+        if(new_addr != old_addr) {
+            leak_insert(e);
+        }
         if(g_stats.current_bytes > g_stats.peak_bytes) {
             g_stats.peak_bytes = g_stats.current_bytes;
         }
     } else {
-        fprintf(stderr, "[MapGuard] WARNING: leak-tracking pool exhausted in mremap\n");
+        mg_leak_entry_t *ne = leak_pool_alloc();
+        if(ne) {
+            ne->addr = new_addr;
+            ne->size = new_size;
+            ne->alloc_ts = now;
+            ne->last_update_ts = now;
+            ne->status = MG_LEAK_STATUS_ACTIVE;
+            ne->fd = -1;
+            leak_insert(ne);
+            g_stats.current_bytes += new_size;
+            g_stats.outstanding++;
+            if(g_stats.current_bytes > g_stats.peak_bytes) {
+                g_stats.peak_bytes = g_stats.current_bytes;
+            }
+        }
     }
+    bool log_pool_exhaustion =
+        !pool_exhausted_before && g_stats.pool_exhausted;
     UNLOCK_LEAK();
+    if(log_pool_exhaustion) {
+        mg_log_pool_exhaustion();
+    }
+    mg_internal = was_internal;
 }
 
 /* Take a snapshot of current memory usage for growth detection */
@@ -609,6 +768,43 @@ static void mg_generate_report_text(FILE *fp,
     fprintf(fp, "=======================================================\n");
 }
 
+static void mg_json_write_string(FILE *fp, const char *value) {
+    fputc('"', fp);
+    for(const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        switch(*p) {
+            case '"':
+                fputs("\\\"", fp);
+                break;
+            case '\\':
+                fputs("\\\\", fp);
+                break;
+            case '\b':
+                fputs("\\b", fp);
+                break;
+            case '\f':
+                fputs("\\f", fp);
+                break;
+            case '\n':
+                fputs("\\n", fp);
+                break;
+            case '\r':
+                fputs("\\r", fp);
+                break;
+            case '\t':
+                fputs("\\t", fp);
+                break;
+            default:
+                if(*p < 0x20) {
+                    fprintf(fp, "\\u%04x", *p);
+                } else {
+                    fputc(*p, fp);
+                }
+                break;
+        }
+    }
+    fputc('"', fp);
+}
+
 /* Generate JSON report */
 static void mg_generate_report_json(FILE *fp,
                                     uint64_t total_allocs, uint64_t outstanding,
@@ -655,10 +851,15 @@ static void mg_generate_report_json(FILE *fp,
         fprintf(fp, "      \"address\": \"0x%lx\",\n", (unsigned long)(uintptr_t)entries[i].addr);
         fprintf(fp, "      \"size_bytes\": %zu,\n", entries[i].size);
         fprintf(fp, "      \"age_seconds\": %.3f,\n", age_sec);
-        fprintf(fp, "      \"prot\": \"%s\",\n", prot_to_str(entries[i].prot));
-        fprintf(fp, "      \"flags\": \"%s\",\n", flags_buf);
+        fprintf(fp, "      \"prot\": ");
+        mg_json_write_string(fp, prot_to_str(entries[i].prot));
+        fprintf(fp, ",\n      \"flags\": ");
+        mg_json_write_string(fp, flags_buf);
+        fprintf(fp, ",\n");
         fprintf(fp, "      \"fd\": %d,\n", entries[i].fd);
-        fprintf(fp, "      \"status\": \"%s\",\n", status_to_str(entries[i].status));
+        fprintf(fp, "      \"status\": ");
+        mg_json_write_string(fp, status_to_str(entries[i].status));
+        fprintf(fp, ",\n");
         fprintf(fp, "      \"call_site\": \"0x%lx\",\n", (unsigned long)entries[i].call_site);
         fprintf(fp, "      \"stack_trace\": [\n");
 
@@ -684,7 +885,9 @@ static void mg_generate_report_json(FILE *fp,
                 snprintf(frame_desc, sizeof(frame_desc), "#%d  0x%lx", f, (unsigned long)stack_addr);
             }
 
-            fprintf(fp, "        \"%s\"%s\n", frame_desc, (printed_frames < frame_count) ? "," : "");
+            fprintf(fp, "        ");
+            mg_json_write_string(fp, frame_desc);
+            fprintf(fp, "%s\n", (printed_frames < frame_count) ? "," : "");
         }
 
         fprintf(fp, "      ]\n");
@@ -736,6 +939,8 @@ static void mg_generate_report_csv(FILE *fp,
 
 /* Generate final report */
 void mg_tracker_generate_report(void) {
+    int was_internal = mg_internal;
+    mg_internal = 1;
     const char *format_env = getenv("MG_REPORT_FORMAT");
     const char *ext = "txt";
     int format = 0; /* 0: text, 1: json, 2: csv */
@@ -817,6 +1022,7 @@ void mg_tracker_generate_report(void) {
     FILE *fp = fopen(report_path, "w");
     if(!fp) {
         fprintf(stderr, "[MapGuard] ERROR: cannot open report file: %s\n", report_path);
+        mg_internal = was_internal;
         return;
     }
 
@@ -839,16 +1045,18 @@ void mg_tracker_generate_report(void) {
 
     fclose(fp);
     fprintf(stderr, "[MapGuard] Report written to: %s\n", report_path);
+    mg_internal = was_internal;
 }
 
 
 /* ===== Snapshot thread ===== */
 static void *snapshot_thread_func(void *arg) {
     (void)arg;
-    while(snapshot_thread_running) {
+    mg_internal = 1;
+    while(atomic_load_explicit(&snapshot_thread_running, memory_order_acquire)) {
         /* Sleep for the configured interval */
         usleep(mg_snapshot_interval_ms * 1000);
-        if(!snapshot_thread_running) break;
+        if(!atomic_load_explicit(&snapshot_thread_running, memory_order_acquire)) break;
         mg_tracker_take_snapshot();
 
         /* Check growth and log warning */
@@ -864,21 +1072,28 @@ static void *snapshot_thread_func(void *arg) {
             }
         }
     }
+    mg_internal = 0;
     return NULL;
 }
 
 void mg_snapshot_thread_start(void) {
-    snapshot_thread_running = 1;
+    atomic_store_explicit(&snapshot_thread_running, true, memory_order_release);
+    int was_internal = mg_internal;
+    mg_internal = 1;
     if(pthread_create(&snapshot_tid, NULL, snapshot_thread_func, NULL) != 0) {
         fprintf(stderr, "[MapGuard] WARNING: failed to start snapshot thread\n");
-        snapshot_thread_running = 0;
+        atomic_store_explicit(&snapshot_thread_running, false, memory_order_release);
     }
+    mg_internal = was_internal;
 }
 
 void mg_snapshot_thread_stop(void) {
-    if(snapshot_thread_running) {
-        snapshot_thread_running = 0;
+    if(atomic_exchange_explicit(&snapshot_thread_running, false,
+                                memory_order_acq_rel)) {
+        int was_internal = mg_internal;
+        mg_internal = 1;
         pthread_join(snapshot_tid, NULL);
+        mg_internal = was_internal;
     }
 }
 
@@ -913,18 +1128,20 @@ mapguard_cache_metadata_t *new_mce_page() {
 }
 
 void *allocate_guard_page(void *p) {
+    int was_internal = mg_internal;
     mg_internal = 1;
     void *result = g_real_mmap(p, g_page_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    mg_internal = 0;
+    mg_internal = was_internal;
     return result;
 }
 
 void make_guard_page(void *p) {
+    int was_internal = mg_internal;
     mg_internal = 1;
     g_real_mprotect(p, g_page_size, PROT_NONE);
     madvise(p, g_page_size, MADV_DONTNEED);
-    mg_internal = 0;
     LOG("Mapped guard page %p", p);
+    mg_internal = was_internal;
 }
 
 void unmap_top_guard_page(mapguard_cache_entry_t *mce) {
@@ -933,11 +1150,12 @@ void unmap_top_guard_page(mapguard_cache_entry_t *mce) {
         LOG_AND_ABORT("Attempting to unmap missing top guard page")
     }
 #endif
+    int was_internal = mg_internal;
     mg_internal = 1;
     g_real_munmap(mce->start + mce->size, g_page_size);
-    mg_internal = 0;
     mce->guarded_t = false;
     LOG("Unmapped top guard page %p", mce->start + mce->size);
+    mg_internal = was_internal;
 }
 
 void unmap_bottom_guard_page(mapguard_cache_entry_t *mce) {
@@ -946,11 +1164,12 @@ void unmap_bottom_guard_page(mapguard_cache_entry_t *mce) {
         LOG_AND_ABORT("Attempting to unmap missing bottom guard page")
     }
 #endif
+    int was_internal = mg_internal;
     mg_internal = 1;
     g_real_munmap(mce->start - g_page_size, g_page_size);
-    mg_internal = 0;
     mce->guarded_b = false;
     LOG("Unmapped bottom guard page %p", mce->start - g_page_size);
+    mg_internal = was_internal;
 }
 
 void unmap_guard_pages(mapguard_cache_entry_t *mce) {
@@ -1039,13 +1258,20 @@ int32_t env_to_int(char *string) {
     return (int32_t)val;
 }
 
+static bool cache_entry_contains(const mapguard_cache_entry_t *mce, uintptr_t addr) {
+    uintptr_t start = (uintptr_t)mce->start;
+    return mce->size <= UINTPTR_MAX - start &&
+           addr >= start && addr - start < mce->size;
+}
+
 mapguard_cache_entry_t *get_cache_entry(void *addr) {
+    uintptr_t target = (uintptr_t)addr;
     void *page_addr = (void *)ROUND_DOWN_PAGE((uintptr_t)addr);
     uint32_t bucket = HASH_ADDR(page_addr);
     mapguard_cache_entry_t *mce = g_hash_table[bucket];
 
     while(mce != NULL) {
-        if(addr >= mce->start && addr < (mce->start + mce->size)) {
+        if(cache_entry_contains(mce, target)) {
             return mce;
         }
         mce = mce->hash_next;
@@ -1059,7 +1285,7 @@ mapguard_cache_entry_t *get_cache_entry(void *addr) {
         }
         mce = g_hash_table[probe_bucket];
         while(mce != NULL) {
-            if(addr >= mce->start && addr < (mce->start + mce->size)) {
+            if(cache_entry_contains(mce, target)) {
                 return mce;
             }
             mce = mce->hash_next;
@@ -1102,7 +1328,11 @@ void cache_entry_remove(mapguard_cache_entry_t *mce) {
  * =================================================================== */
 
 __attribute__((constructor)) void mapguard_ctor() {
-    g_page_size = getpagesize();
+    int page_size = getpagesize();
+    if(page_size <= 0 || ((unsigned int)page_size & ((unsigned int)page_size - 1)) != 0) {
+        LOG_AND_ABORT("Invalid system page size: %d", page_size);
+    }
+    g_page_size = (size_t)page_size;
     g_page_shift = __builtin_ctzl(g_page_size);
 
 #if THREAD_SUPPORT
@@ -1231,12 +1461,23 @@ __attribute__((destructor)) void mapguard_dtor() {
 
 /* Hook mmap in libc */
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    if(mg_internal) {
+        return g_real_mmap(addr, length, prot, flags, fd, offset);
+    }
+
     /* We don't intercept file backed mappings */
     if(fd != -1) {
         return g_real_mmap(addr, length, prot, flags, fd, offset);
     }
 
-    size_t rounded_length = ROUND_UP_PAGE(length);
+    if(length == 0) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    size_t rounded_length;
+    if(!mg_round_up_page(length, &rounded_length)) {
+        return MAP_FAILED;
+    }
     const bool is_rwx = (prot & PROT_WRITE) && (prot & PROT_EXEC);
 
     /* Fast path: no policies enabled, no tracking needed */
@@ -1270,7 +1511,12 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     size_t alloc_length = rounded_length;
 
     if(g_mapguard_policy.enable_guard_pages) {
-        alloc_length += (g_page_size << 1);
+        if(g_page_size > SIZE_MAX / 2 ||
+           alloc_length > SIZE_MAX - (g_page_size * 2)) {
+            errno = ENOMEM;
+            return MAP_FAILED;
+        }
+        alloc_length += g_page_size * 2;
     }
 
     map_ptr = g_real_mmap(addr, alloc_length, prot, flags, fd, offset);
@@ -1342,15 +1588,26 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 
 /* Hook munmap in libc */
 int munmap(void *addr, size_t length) {
+    if(mg_internal) {
+        return g_real_munmap(addr, length);
+    }
+
     if(length == 0) {
-        return EINVAL;
+        errno = EINVAL;
+        return -1;
     }
 
     if(((uintptr_t)addr & (g_page_size - 1)) != 0) {
-        return EINVAL;
+        errno = EINVAL;
+        return -1;
     }
 
-    size_t rounded_length = ROUND_UP_PAGE(length);
+    size_t rounded_length;
+    if(!mg_round_up_page(length, &rounded_length) ||
+       rounded_length > UINTPTR_MAX - (uintptr_t)addr) {
+        errno = EINVAL;
+        return -1;
+    }
 
     /* Fast path when mapping cache disabled */
     if(g_mapguard_policy.use_mapping_cache == false) {
@@ -1454,12 +1711,14 @@ int munmap(void *addr, size_t length) {
             mce->size -= length_pages;
         }
 
+        void *remaining_addr = mce->start;
+        size_t remaining_size = mce->size;
         cache_entry_insert(mce);
         UNLOCK_MG();
 
         if(!mg_internal) {
             mg_tracker_record_partial_free(orig_start, length_pages,
-                                           mce->start, mce->size);
+                                           remaining_addr, remaining_size);
         }
         return ret;
     }
@@ -1495,11 +1754,13 @@ int munmap(void *addr, size_t length) {
             mce->size = addr - mce->start;
         }
 
+        void *remaining_addr = mce->start;
+        size_t remaining_size = mce->size;
         UNLOCK_MG();
 
         if(!mg_internal) {
             mg_tracker_record_partial_free(orig_start, length_pages,
-                                           mce->start, mce->size);
+                                           remaining_addr, remaining_size);
         }
         return ret;
     }
@@ -1513,12 +1774,17 @@ int munmap(void *addr, size_t length) {
         void *upper_start = addr + length_pages;
         size_t upper_size = (mce->start + mce->size) - upper_start;
         size_t lower_size = addr - mce->start;
+        bool original_guarded_t = mce->guarded_t;
 
         mapguard_cache_entry_t *upper_mce = find_free_mce();
         if(upper_mce == NULL) {
             UNLOCK_MG();
             LOG_AND_ABORT("Failed to allocate MCE for split mapping");
         }
+
+        bool lower_guarded_t = false;
+        bool upper_guarded_b = false;
+        bool upper_guarded_t = original_guarded_t;
 
         if(g_mapguard_policy.enable_guard_pages) {
             if(length_pages == g_page_size) {
@@ -1527,16 +1793,14 @@ int munmap(void *addr, size_t length) {
                 memset(addr, 0, g_page_size);
                 make_guard_page(addr);
                 mg_internal = 0;
-                mce->guarded_t = true;
-                upper_mce->guarded_b = false;
-                upper_mce->guarded_t = mce->guarded_t;
+                lower_guarded_t = true;
             } else if(length_pages == (g_page_size * 2)) {
                 mg_internal = 1;
                 g_real_mprotect(addr, g_page_size, PROT_READ | PROT_WRITE);
                 memset(addr, 0, g_page_size);
                 make_guard_page(addr);
                 mg_internal = 0;
-                mce->guarded_t = true;
+                lower_guarded_t = true;
 
                 void *upper_guard = addr + g_page_size;
                 mg_internal = 1;
@@ -1544,17 +1808,30 @@ int munmap(void *addr, size_t length) {
                 memset(upper_guard, 0, g_page_size);
                 make_guard_page(upper_guard);
                 mg_internal = 0;
-                upper_mce->guarded_b = true;
+                upper_guarded_b = true;
                 upper_start = upper_guard + g_page_size;
                 upper_size = (mce->start + mce->size) - upper_start;
-                upper_mce->guarded_t = true;
             } else {
+                void *unmap_start = addr + g_page_size;
+                size_t unmap_length = length_pages - (g_page_size * 2);
+                mg_internal = 1;
+                ret = g_real_munmap(unmap_start, unmap_length);
+                mg_internal = 0;
+                if(ret != 0) {
+                    memset(upper_mce, 0, sizeof(mapguard_cache_entry_t));
+                    mapguard_cache_metadata_t *metadata =
+                        (mapguard_cache_metadata_t *)ROUND_DOWN_PAGE((uintptr_t)upper_mce);
+                    metadata->free++;
+                    UNLOCK_MG();
+                    return ret;
+                }
+
                 mg_internal = 1;
                 g_real_mprotect(addr, g_page_size, PROT_READ | PROT_WRITE);
                 memset(addr, 0, g_page_size);
                 make_guard_page(addr);
                 mg_internal = 0;
-                mce->guarded_t = true;
+                lower_guarded_t = true;
 
                 void *upper_guard = addr + length_pages - g_page_size;
                 mg_internal = 1;
@@ -1562,25 +1839,9 @@ int munmap(void *addr, size_t length) {
                 memset(upper_guard, 0, g_page_size);
                 make_guard_page(upper_guard);
                 mg_internal = 0;
-                upper_mce->guarded_b = true;
-
-                void *unmap_start = addr + g_page_size;
-                size_t unmap_length = length_pages - (g_page_size * 2);
-                mg_internal = 1;
-                ret = g_real_munmap(unmap_start, unmap_length);
-                mg_internal = 0;
-
-                if(ret != 0) {
-                    memset(upper_mce, 0, sizeof(mapguard_cache_entry_t));
-                    mapguard_cache_metadata_t *metadata = (mapguard_cache_metadata_t *)ROUND_DOWN_PAGE((uintptr_t)upper_mce);
-                    metadata->free++;
-                    UNLOCK_MG();
-                    return ret;
-                }
-
+                upper_guarded_b = true;
                 upper_start = upper_guard + g_page_size;
                 upper_size = (mce->start + mce->size) - upper_start;
-                upper_mce->guarded_t = mce->guarded_t;
             }
         } else {
             mg_internal = 1;
@@ -1588,7 +1849,8 @@ int munmap(void *addr, size_t length) {
             mg_internal = 0;
             if(ret != 0) {
                 memset(upper_mce, 0, sizeof(mapguard_cache_entry_t));
-                mapguard_cache_metadata_t *metadata = (mapguard_cache_metadata_t *)ROUND_DOWN_PAGE((uintptr_t)upper_mce);
+                mapguard_cache_metadata_t *metadata =
+                    (mapguard_cache_metadata_t *)ROUND_DOWN_PAGE((uintptr_t)upper_mce);
                 metadata->free++;
                 UNLOCK_MG();
                 return ret;
@@ -1601,15 +1863,19 @@ int munmap(void *addr, size_t length) {
         upper_mce->current_prot = mce->current_prot;
         upper_mce->alloc_ts = mce->alloc_ts;
         upper_mce->call_site = mce->call_site;
+        upper_mce->guarded_b = upper_guarded_b;
+        upper_mce->guarded_t = upper_guarded_t;
         cache_entry_insert(upper_mce);
 
         mce->size = lower_size;
+        mce->guarded_t = lower_guarded_t;
+        void *lower_start = mce->start;
 
         UNLOCK_MG();
 
         if(!mg_internal) {
             mg_tracker_record_split(orig_start,
-                                    mce->start, lower_size,
+                                    lower_start, lower_size,
                                     upper_start, upper_size,
                                     orig_ts, orig_site);
         }
@@ -1629,6 +1895,8 @@ int munmap(void *addr, size_t length) {
 int mprotect(void *addr, size_t len, int prot) {
     mapguard_cache_entry_t *mce = NULL;
     int32_t ret;
+    bool size_mismatch = false;
+    size_t cached_size = 0;
 
     if(g_mapguard_policy.prevent_rwx && (prot & PROT_WRITE) && (prot & PROT_EXEC)) {
         LOG("Preventing RWX mprotect");
@@ -1642,18 +1910,18 @@ int mprotect(void *addr, size_t len, int prot) {
 
         if(mce != NULL) {
             if(g_mapguard_policy.prevent_transition_to_x && (prot & PROT_EXEC) && (mce->immutable_prot & PROT_WRITE)) {
+                UNLOCK_MG();
                 LOG("Cannot allow mapping %p to be set PROT_EXEC, it was previously PROT_WRITE", addr);
                 MAYBE_PANIC();
                 errno = EINVAL;
-                UNLOCK_MG();
                 return ERROR;
             }
 
             if(g_mapguard_policy.prevent_transition_from_x && (prot & PROT_WRITE) && (mce->immutable_prot & PROT_EXEC)) {
+                UNLOCK_MG();
                 LOG("Cannot allow mapping %p to transition from PROT_EXEC to PROT_WRITE", addr);
                 MAYBE_PANIC();
                 errno = EINVAL;
-                UNLOCK_MG();
                 return ERROR;
             }
         }
@@ -1662,13 +1930,18 @@ int mprotect(void *addr, size_t len, int prot) {
 
         if(ret == 0 && mce) {
             if(mce->size != len) {
-                LOG("Cached mapping size %zu bytes but mprotected %zu bytes", mce->size, len);
+                size_mismatch = true;
+                cached_size = mce->size;
             }
             mce->immutable_prot |= prot;
             mce->current_prot = prot;
         }
 
         UNLOCK_MG();
+        if(size_mismatch) {
+            LOG("Cached mapping size %zu bytes but mprotected %zu bytes",
+                cached_size, len);
+        }
     } else {
         ret = g_real_mprotect(addr, len, prot);
     }
@@ -1681,7 +1954,19 @@ void *mremap(void *__addr, size_t __old_len, size_t __new_len, int __flags, ...)
     void *new_address = NULL;
     void *map_ptr = NULL;
 
-    if((__flags & MREMAP_FIXED) || (__flags & MAP_FIXED_NOREPLACE)) {
+    if(mg_internal) {
+        if(__flags & MREMAP_FIXED) {
+            va_list vl;
+            va_start(vl, __flags);
+            new_address = va_arg(vl, void *);
+            va_end(vl);
+            return g_real_mremap(__addr, __old_len, __new_len, __flags,
+                                 new_address);
+        }
+        return g_real_mremap(__addr, __old_len, __new_len, __flags);
+    }
+
+    if(__flags & MREMAP_FIXED) {
         va_list vl;
         va_start(vl, __flags);
         new_address = va_arg(vl, void *);
@@ -1694,8 +1979,13 @@ void *mremap(void *__addr, size_t __old_len, size_t __new_len, int __flags, ...)
         }
     }
 
-    size_t rounded_old_len = ROUND_UP_PAGE(__old_len);
-    size_t rounded_new_len = ROUND_UP_PAGE(__new_len);
+    size_t rounded_old_len;
+    size_t rounded_new_len;
+    if(!mg_round_up_page(__old_len, &rounded_old_len) ||
+       !mg_round_up_page(__new_len, &rounded_new_len)) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
 
     if(new_address != NULL) {
         map_ptr = g_real_mremap(__addr, rounded_old_len, rounded_new_len, __flags, new_address);
@@ -1713,9 +2003,23 @@ void *mremap(void *__addr, size_t __old_len, size_t __new_len, int __flags, ...)
 
         if(mce) {
             if(mce->start != map_ptr) {
+                mapguard_cache_entry_t *target_mce = NULL;
+                if(new_address) {
+                    target_mce = get_cache_entry(map_ptr);
+                }
                 unmap_guard_pages(mce);
                 mce->guarded_b = false;
                 mce->guarded_t = false;
+                if(target_mce && target_mce != mce &&
+                   target_mce->start == map_ptr &&
+                   target_mce->size == rounded_new_len) {
+                    unmap_guard_pages(target_mce);
+                    cache_entry_remove(target_mce);
+                    mapguard_cache_metadata_t *metadata =
+                        (mapguard_cache_metadata_t *)ROUND_DOWN_PAGE((uintptr_t)target_mce);
+                    metadata->free++;
+                    memset(target_mce, 0, sizeof(*target_mce));
+                }
                 cache_entry_remove(mce);
                 mce->start = map_ptr;
                 mce->size = rounded_new_len;

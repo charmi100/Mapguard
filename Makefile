@@ -54,7 +54,15 @@ tests: library_debug
 	@echo "make tests"
 	mkdir -p $(BUILD_DIR)/
 	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_test.c -I $(INCLUDE)  -o $(BUILD_DIR)/mapguard_test -L build/ -ldl
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_mremap_test.c -I $(INCLUDE)  -o $(BUILD_DIR)/mapguard_mremap_test -L build/ -ldl
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_partial_munmap_test.c -I $(INCLUDE)  -o $(BUILD_DIR)/mapguard_partial_munmap_test -L build/ -ldl
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_growth_test.c -I $(INCLUDE)  -o $(BUILD_DIR)/mapguard_growth_test -L build/ -ldl
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_concurrency_test.c -I $(INCLUDE)  -o $(BUILD_DIR)/mapguard_concurrency_test -L build/ -lpthread -ldl
 	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_thread_test.c -I $(INCLUDE)  -o $(BUILD_DIR)/mapguard_thread_test -L build/ -lpthread -ldl
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_guard_page_test.c -I $(INCLUDE) -o $(BUILD_DIR)/mapguard_guard_page_test -L build/ -ldl
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_pool_exhaustion_test.c -I $(INCLUDE) -o $(BUILD_DIR)/mapguard_pool_exhaustion_test -L build/ -ldl
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) $(TEST_SRC)/mapguard_overflow_test.c -I $(INCLUDE) -o $(BUILD_DIR)/mapguard_overflow_test -L build/ -ldl
+	$(CC) $(CFLAGS) $(EXE_CFLAGS) $(DEBUG_FLAGS) -Wl,--export-dynamic $(TEST_SRC)/mapguard_reporting_test.c -I $(INCLUDE) -o $(BUILD_DIR)/mapguard_reporting_test
 
 perf_tests:
 	$(CC) $(CFLAGS) $(EXE_CFLAGS) -o build/mapguard_perf_test tests/mapguard_perf_test.c
