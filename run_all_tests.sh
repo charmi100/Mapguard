@@ -30,6 +30,7 @@ echo "--- Running existing tests ---"
 export MG_PANIC_ON_VIOLATION=0
 export MG_USE_MAPPING_CACHE=1
 export MG_PREVENT_RWX=1
+export MG_PREVENT_TRANSITION_TO_X=1
 export MG_PREVENT_TRANSITION_FROM_X=1
 export MG_PREVENT_STATIC_ADDRESS=1
 export MG_ENABLE_GUARD_PAGES=1
@@ -39,13 +40,25 @@ export MG_SNAPSHOT_INTERVAL_MS=500
 export MG_OBSERVE_COUNT=5
 export MG_GROWTH_THRESHOLD_BYTES=1048576
 
+failures=0
+
 echo "Running mapguard_test..."
 export MG_REPORT_PATH=/tmp/mg_report_existing.txt
-LD_PRELOAD=build/libmapguard.so build/mapguard_test 2>/dev/null && echo "[PASS] mapguard_test" || echo "[FAIL] mapguard_test"
+if LD_PRELOAD=build/libmapguard.so build/mapguard_test 2>/dev/null; then
+    echo "[PASS] mapguard_test"
+else
+    echo "[FAIL] mapguard_test"
+    failures=$((failures + 1))
+fi
 
 echo "Running mapguard_thread_test..."
 export MG_REPORT_PATH=/tmp/mg_report_thread.txt
-LD_PRELOAD=build/libmapguard.so build/mapguard_thread_test 2>/dev/null && echo "[PASS] mapguard_thread_test" || echo "[FAIL] mapguard_thread_test"
+if LD_PRELOAD=build/libmapguard.so build/mapguard_thread_test 2>/dev/null; then
+    echo "[PASS] mapguard_thread_test"
+else
+    echo "[FAIL] mapguard_thread_test"
+    failures=$((failures + 1))
+fi
 
 # ---- Run demos ----
 echo ""
@@ -65,6 +78,7 @@ if [ "$OUTSTANDING" = "0" ]; then
     echo "[PASS] normal_demo: 0 outstanding leaks confirmed"
 else
     echo "[FAIL] normal_demo: expected 0 leaks, got $OUTSTANDING"
+    failures=$((failures + 1))
 fi
 
 # Leak demo - should show 2 leaks
@@ -77,6 +91,7 @@ if [ "$OUTSTANDING" = "2" ]; then
     echo "[PASS] leak_demo: 2 outstanding leaks confirmed"
 else
     echo "[FAIL] leak_demo: expected 2 leaks, got $OUTSTANDING"
+    failures=$((failures + 1))
 fi
 grep "Outstanding Application Mappings" /tmp/mg_report_leak.txt
 
@@ -86,7 +101,12 @@ echo ">> partial_munmap_demo (expect: 0 outstanding - all cleaned up):"
 export MG_REPORT_PATH=/tmp/mg_report_partial.txt
 LD_PRELOAD=build/libmapguard.so build/partial_munmap_demo 2>/dev/null
 OUTSTANDING=$(grep "Outstanding mappings:" /tmp/mg_report_partial.txt | awk '{print $NF}')
-echo "  Outstanding: $OUTSTANDING"
+if [ "$OUTSTANDING" = "0" ]; then
+    echo "  Outstanding: $OUTSTANDING"
+else
+    echo "[FAIL] partial_munmap_demo: expected 0 outstanding mappings, got $OUTSTANDING"
+    failures=$((failures + 1))
+fi
 grep "Peak mapped bytes:" /tmp/mg_report_partial.txt
 
 # mremap demo
@@ -99,6 +119,7 @@ if [ "$OUTSTANDING" = "0" ]; then
     echo "[PASS] mremap_demo: 0 outstanding leaks confirmed"
 else
     echo "[FAIL] mremap_demo: expected 0 leaks, got $OUTSTANDING"
+    failures=$((failures + 1))
 fi
 grep "Peak mapped bytes:" /tmp/mg_report_mremap.txt
 
@@ -114,13 +135,15 @@ OUTSTANDING=$(grep "Outstanding mappings:" /tmp/mg_report_growth.txt | awk '{pri
 if [ "$OUTSTANDING" = "12" ]; then
     echo "[PASS] growth_demo: 12 outstanding leaks confirmed"
 else
-    echo "[CHECK] growth_demo: expected 12 leaks, got $OUTSTANDING"
+    echo "[FAIL] growth_demo: expected 12 outstanding mappings, got $OUTSTANDING"
+    failures=$((failures + 1))
 fi
 if grep -q "GROWTH WARNING" /tmp/mg_report_growth.txt; then
     echo "[PASS] growth_demo: growth warning present"
     grep "Memory grew" /tmp/mg_report_growth.txt
 else
     echo "[FAIL] growth_demo: no growth warning found"
+    failures=$((failures + 1))
 fi
 
 echo ""
@@ -134,3 +157,9 @@ echo "mremap_demo:         outstanding=$(grep 'Outstanding mappings:' /tmp/mg_re
 echo "growth_demo:         outstanding=$(grep 'Outstanding mappings:' /tmp/mg_report_growth.txt | awk '{print $NF}')"
 echo "growth_demo:         warning=$(grep -c 'GROWTH WARNING' /tmp/mg_report_growth.txt) occurrence(s)"
 echo "========================================"
+
+if [ "$failures" -ne 0 ]; then
+    echo "Full test suite: $failures failure(s)"
+    exit 1
+fi
+echo "Full test suite: all checks passed"

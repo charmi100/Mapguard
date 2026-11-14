@@ -58,6 +58,24 @@ operations, persistent-growth scenarios, guard pages, metadata-pool exhaustion,
 overflow handling, and text/JSON/CSV report validation. Report validation
 requires Python 3.
 
+The latest recorded run in an Ubuntu 22.04 Docker environment completed with
+`21 succeeded, 0 failed`. This result describes that run only; it is not a
+claim that every Linux distribution or configuration has been tested.
+
+Reports include at most 256 mapping records. Aggregate outstanding-mapping and
+byte totals account for all tracked mappings, including mappings omitted from
+the record list. Text reports disclose when records were truncated. JSON
+reports include `total_outstanding_mappings`, `reported_mappings`,
+`omitted_mappings`, and `truncated` fields. CSV reports contain `mapping` rows
+for reported mappings and `summary` rows in the `record_type`, `metadata_key`,
+and `metadata_value` columns; the summary rows provide the total, reported, and
+omitted counts, truncation status, current mapped bytes, and peak mapped bytes.
+
+An outstanding mapping is a mapping still tracked when a report is generated.
+It is not, by itself, proof of a memory leak: some applications intentionally
+keep mappings alive, and leak classification requires application-specific
+lifecycle context.
+
 The test compiler defaults to Clang; select another compiler with `CC`, and
 optionally direct test logs with `MG_TEST_OUTPUT`:
 
@@ -65,7 +83,7 @@ optionally direct test logs with `MG_TEST_OUTPUT`:
 # CC=gcc MG_TEST_OUTPUT=/tmp/mapguard-tests.log ./run_tests.sh
 Running mapguard_test test... Succeeded
 ...
-Tests: 15 succeeded, 0 failed
+Tests: 21 succeeded, 0 failed
 
 # ./run_perf_test.sh
 ================================================================

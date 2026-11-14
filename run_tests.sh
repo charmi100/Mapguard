@@ -16,7 +16,7 @@ export MG_PREVENT_RWX=1
 export MG_PREVENT_TRANSITION_FROM_X=1
 export MG_PREVENT_STATIC_ADDRESS=1
 export MG_ENABLE_GUARD_PAGES=1
-export MG_PREVENT_X_TRANSITION=1
+export MG_PREVENT_TRANSITION_TO_X=1
 export MG_POISON_ON_ALLOCATION=1
 export MG_ENABLE_SYSLOG=0
 
@@ -96,20 +96,23 @@ report_dir=$(mktemp -d "${TMPDIR:-/tmp}/mapguard-reports.XXXXXX")
 report_binary="$report_dir/report \"quoted\".test"
 cp build/mapguard_reporting_test "$report_binary"
 for format in text json csv; do
-    report_path="$report_dir/report.$format"
-    output_path="$report_dir/output.$format"
-    echo -n "Running $format report validation"
-    if MG_ENABLE_GUARD_PAGES=0 MG_USE_MAPPING_CACHE=0 MG_PREVENT_STATIC_ADDRESS=0 \
-        MG_REPORT_FORMAT="$format" LD_PRELOAD=build/libmapguard.so \
-        "$report_binary" "$format" "$report_path" >"$output_path" 2>>"$TEST_OUTPUT" &&
-        python3 tests/validate_mapguard_report.py "$format" "$report_path" "$output_path" \
-        >>"$TEST_OUTPUT" 2>&1; then
-        echo "... Succeeded"
-        succeeded=$((succeeded+1))
-    else
-        echo "... Failed"
-        failure=$((failure+1))
-    fi
+    for mapping_count in 1 256 300; do
+        report_path="$report_dir/report.$format.$mapping_count"
+        cleanup_report_path="$report_path.cleanup"
+        output_path="$report_dir/output.$format.$mapping_count"
+        echo -n "Running $format report validation ($mapping_count mappings)"
+        if MG_ENABLE_GUARD_PAGES=0 MG_USE_MAPPING_CACHE=0 MG_PREVENT_STATIC_ADDRESS=0 \
+            MG_REPORT_FORMAT="$format" LD_PRELOAD=build/libmapguard.so \
+            "$report_binary" "$format" "$report_path" "$mapping_count" >"$output_path" 2>>"$TEST_OUTPUT" &&
+            python3 tests/validate_mapguard_report.py "$format" "$report_path" "$output_path" \
+                "$mapping_count" "$cleanup_report_path" >>"$TEST_OUTPUT" 2>&1; then
+            echo "... Succeeded"
+            succeeded=$((succeeded+1))
+        else
+            echo "... Failed"
+            failure=$((failure+1))
+        fi
+    done
 done
 rm -rf "$report_dir"
 
@@ -119,7 +122,7 @@ unset MG_PREVENT_RWX
 unset MG_PREVENT_TRANSITION_FROM_X
 unset MG_PREVENT_STATIC_ADDRESS
 unset MG_ENABLE_GUARD_PAGES
-unset MG_PREVENT_X_TRANSITION
+unset MG_PREVENT_TRANSITION_TO_X
 unset MG_POISON_ON_ALLOCATION
 unset MG_ENABLE_SYSLOG
 

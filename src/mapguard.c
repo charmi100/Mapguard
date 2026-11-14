@@ -824,6 +824,11 @@ static void mg_generate_report_json(FILE *fp,
     fprintf(fp, "    \"snapshots_collected\": %zu,\n", valid_snaps);
     fprintf(fp, "    \"pool_exhausted\": %s\n", pool_exhausted ? "true" : "false");
     fprintf(fp, "  },\n");
+    fprintf(fp, "  \"total_outstanding_mappings\": %lu,\n", (unsigned long)outstanding);
+    fprintf(fp, "  \"reported_mappings\": %zu,\n", entry_count);
+    fprintf(fp, "  \"omitted_mappings\": %lu,\n",
+            (unsigned long)(outstanding > entry_count ? outstanding - entry_count : 0));
+    fprintf(fp, "  \"truncated\": %s,\n", outstanding > entry_count ? "true" : "false");
 
     fprintf(fp, "  \"growth_detection\": {\n");
     fprintf(fp, "    \"growth_detected\": %s,\n", growth_detected ? "true" : "false");
@@ -907,24 +912,13 @@ static void mg_generate_report_csv(FILE *fp,
                                    uint64_t growth_oldest_ts, uint64_t growth_newest_ts,
                                    const report_entry_t *entries, size_t entry_count,
                                    uint64_t now) {
-    (void)total_allocs;
-    (void)outstanding;
-    (void)current_bytes;
-    (void)peak_bytes;
-    (void)valid_snaps;
-    (void)pool_exhausted;
-    (void)growth_detected;
-    (void)growth_oldest;
-    (void)growth_newest;
-    (void)growth_oldest_ts;
-    (void)growth_newest_ts;
-
-    fprintf(fp, "index,address,size_bytes,age_seconds,prot,flags,fd,status,call_site\n");
+    /* record_type separates mapping rows from summary metadata rows. */
+    fprintf(fp, "index,address,size_bytes,age_seconds,prot,flags,fd,status,call_site,record_type,metadata_key,metadata_value\n");
     for(size_t i = 0; i < entry_count; i++) {
         double age_sec = (double)(now - entries[i].alloc_ts) / 1e9;
         char flags_buf[64];
         flags_to_str(entries[i].flags, flags_buf, sizeof(flags_buf));
-        fprintf(fp, "%zu,0x%lx,%zu,%.3f,%s,%s,%d,%s,0x%lx\n",
+        fprintf(fp, "%zu,0x%lx,%zu,%.3f,%s,%s,%d,%s,0x%lx,mapping,,\n",
                 i + 1,
                 (unsigned long)(uintptr_t)entries[i].addr,
                 entries[i].size,
@@ -935,6 +929,27 @@ static void mg_generate_report_csv(FILE *fp,
                 status_to_str(entries[i].status),
                 (unsigned long)entries[i].call_site);
     }
+
+    fprintf(fp, ",,,,,,,,,summary,total_outstanding_mappings,%lu\n",
+            (unsigned long)outstanding);
+    fprintf(fp, ",,,,,,,,,summary,reported_mappings,%zu\n", entry_count);
+    fprintf(fp, ",,,,,,,,,summary,omitted_mappings,%lu\n",
+            (unsigned long)(outstanding > entry_count ? outstanding - entry_count : 0));
+    fprintf(fp, ",,,,,,,,,summary,truncated,%s\n",
+            outstanding > entry_count ? "true" : "false");
+    fprintf(fp, ",,,,,,,,,summary,current_mapped_bytes,%lu\n",
+            (unsigned long)current_bytes);
+    fprintf(fp, ",,,,,,,,,summary,peak_mapped_bytes,%lu\n",
+            (unsigned long)peak_bytes);
+
+    (void)total_allocs;
+    (void)valid_snaps;
+    (void)pool_exhausted;
+    (void)growth_detected;
+    (void)growth_oldest;
+    (void)growth_newest;
+    (void)growth_oldest_ts;
+    (void)growth_newest_ts;
 }
 
 /* Generate final report */

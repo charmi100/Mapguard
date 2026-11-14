@@ -16,6 +16,31 @@
 int page_size;
 int alloc_size;
 
+static int current_test_failed;
+static unsigned int passed_tests;
+static unsigned int failed_tests;
+
+#undef LOG
+#define LOG(msg, ...) \
+    do { \
+        if(strncmp((msg), "Failure:", sizeof("Failure:") - 1) == 0) { \
+            current_test_failed = 1; \
+        } \
+        fprintf(stdout, "[LOG][%d](%s) " msg "\n", getpid(), __FUNCTION__, ##__VA_ARGS__); \
+        fflush(stdout); \
+    } while(0);
+
+#define RUN_TEST(test_fn) \
+    do { \
+        current_test_failed = 0; \
+        test_fn(); \
+        if(current_test_failed) { \
+            failed_tests++; \
+        } else { \
+            passed_tests++; \
+        } \
+    } while(0)
+
 void *map_memory(char *desc, int prot) {
     return mmap(0, alloc_size, prot, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 }
@@ -25,7 +50,7 @@ int32_t unmap_memory(void *ptr) {
 }
 
 int32_t unmap_remapped_memory(void *ptr) {
-    return munmap(ptr, alloc_size);
+    return munmap(ptr, alloc_size * 2);
 }
 
 #if defined(__linux__)
@@ -58,6 +83,7 @@ void map_rwx_memory_test() {
 
     if(ptr != MAP_FAILED) {
         LOG("Failure: mapped RWX memory");
+        munmap(ptr, alloc_size);
     } else {
         LOG("Success: failed to map RWX memory");
     }
@@ -105,17 +131,18 @@ void map_then_mremap_test() {
 
     if(ptr == MAP_FAILED) {
         LOG("Failure: to map RW memory");
+        return;
     }
     LOG("mapped RW memory %p", ptr);
-    ptr = remap_memory_test("Remap", ptr);
+    void *remapped_ptr = remap_memory_test("Remap", ptr);
 
-    if(ptr == MAP_FAILED) {
+    if(remapped_ptr == MAP_FAILED) {
         LOG("Failure: to remap memory");
+        unmap_memory(ptr);
     } else {
         LOG("Success: remapped memory");
+        unmap_remapped_memory(remapped_ptr);
     }
-
-    unmap_remapped_memory(ptr);
 }
 #endif
 
@@ -123,9 +150,10 @@ void map_static_address_test() {
     uint8_t *ptr = mmap((void *) STATIC_ADDRESS, page_size * 16, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
     if(ptr != MAP_FAILED) {
-        LOG("Failure: mmapped memory at static address @ %lx", STATIC_ADDRESS);
+        LOG("Failure: mmap with static-address hint was allowed (returned @ %p)", ptr);
+        munmap(ptr, page_size * 16);
     } else {
-        LOG("Success: prevented mmap at static address");
+        LOG("Success: prevented mmap with static-address hint");
     }
 }
 
@@ -426,28 +454,29 @@ int main(int argc, char *argv[]) {
     alloc_size = page_size * 16;
 
     for(int i = 0; i < 16; i++) {
-        map_rw_memory_test();
-        map_rwx_memory_test();
-        map_rw_then_x_memory_test();
+        RUN_TEST(map_rw_memory_test);
+        RUN_TEST(map_rwx_memory_test);
+        RUN_TEST(map_rw_then_x_memory_test);
 #if defined(__linux__)
-        map_then_mremap_test();
+        RUN_TEST(map_then_mremap_test);
 #endif
-        map_static_address_test();
-        check_poison_bytes_test();
-        check_x_to_w_test();
-        check_map_partial_unmap_bottom_test();
-        check_map_partial_unmap_top_test();
-        unmap_partial_rw_memory_test();
-        check_full_unmap_test();
-        check_unmap_from_beginning_test();
-        check_unmap_middle_to_end_test();
-        check_unmap_single_page_middle_test();
-        check_unmap_two_pages_middle_test();
-        check_unmap_three_pages_middle_test();
-        check_unmap_five_pages_middle_test();
-        check_multiple_partial_unmaps_test();
+        RUN_TEST(map_static_address_test);
+        RUN_TEST(check_poison_bytes_test);
+        RUN_TEST(check_x_to_w_test);
+        RUN_TEST(check_map_partial_unmap_bottom_test);
+        RUN_TEST(check_map_partial_unmap_top_test);
+        RUN_TEST(unmap_partial_rw_memory_test);
+        RUN_TEST(check_full_unmap_test);
+        RUN_TEST(check_unmap_from_beginning_test);
+        RUN_TEST(check_unmap_middle_to_end_test);
+        RUN_TEST(check_unmap_single_page_middle_test);
+        RUN_TEST(check_unmap_two_pages_middle_test);
+        RUN_TEST(check_unmap_three_pages_middle_test);
+        RUN_TEST(check_unmap_five_pages_middle_test);
+        RUN_TEST(check_multiple_partial_unmaps_test);
     }
 
     LOG("Done testing");
-    return OK;
+    printf("Test summary: %u passed, %u failed\n", passed_tests, failed_tests);
+    return failed_tests == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
